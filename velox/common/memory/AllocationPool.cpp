@@ -17,10 +17,22 @@
 #include "velox/common/memory/AllocationPool.h"
 
 #include <algorithm>
+#include <limits>
+
+#include <folly/String.h>
 
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/MemoryAllocator.h"
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+// From <linux/mempolicy.h>; declared here to avoid a kernel-header dependency.
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+#endif
 
 namespace facebook::velox::memory {
 
@@ -49,6 +61,8 @@ void AllocationPool::clear() {
   bytesInRun_ = 0;
   currentOffset_ = 0;
   usedBytes_ = 0;
+  numMigratedRanges_ = 0;
+  migratedBytesInRange_ = 0;
 }
 
 std::vector<AllocationPool::Relocation> AllocationPool::clone(
@@ -116,6 +130,82 @@ std::vector<AllocationPool::Relocation> AllocationPool::clone(
         return a.sourceBegin < b.sourceBegin;
       });
   return relocations;
+}
+
+int64_t migratePages(void* addr, int64_t numBytes, int32_t numaNode) {
+#if defined(__linux__)
+  VELOX_CHECK_GE(numaNode, 0, "Invalid NUMA node: {}", numaNode);
+  // One system page per array entry: a huge page migrates as a whole folio on
+  // the first of its base-page requests when the target can allocate one, and
+  // the remaining base-page requests are no-ops.
+  const int64_t pageSize = ::sysconf(_SC_PAGESIZE);
+  const int64_t numPages = bits::roundUp(numBytes, pageSize) / pageSize;
+  constexpr int64_t kBatch = 1 << 14; // 16K pages per syscall.
+  std::vector<void*> pages;
+  std::vector<int32_t> nodes;
+  std::vector<int32_t> status;
+  auto* const begin = reinterpret_cast<char*>(addr);
+  int64_t numFailed = 0;
+  for (int64_t start = 0; start < numPages; start += kBatch) {
+    const int64_t count = std::min(kBatch, numPages - start);
+    pages.resize(count);
+    nodes.assign(count, numaNode);
+    status.assign(count, std::numeric_limits<int32_t>::min());
+    for (int64_t i = 0; i < count; ++i) {
+      pages[i] = begin + (start + i) * pageSize;
+    }
+    const int64_t ret = ::syscall(
+        SYS_move_pages,
+        /*pid=*/0,
+        static_cast<unsigned long>(count),
+        pages.data(),
+        nodes.data(),
+        status.data(),
+        MPOL_MF_MOVE);
+    VELOX_CHECK_GE(ret, 0, "move_pages failed: {}", folly::errnoStr(errno));
+    for (int64_t i = 0; i < count; ++i) {
+      // status[i] holds the node the page ended up on, or a negative errno.
+      if (status[i] != numaNode) {
+        ++numFailed;
+      }
+    }
+  }
+  return numFailed;
+#else
+  VELOX_NYI("move_pages page migration is only supported on Linux");
+#endif
+}
+
+int64_t AllocationPool::migratePagesToNode(int32_t numaNode) {
+  const int64_t pageSize = ::sysconf(_SC_PAGESIZE);
+  const auto numRanges = this->numRanges();
+  int64_t migratedBytes = 0;
+  int64_t numFailed = 0;
+  for (auto i = numMigratedRanges_; i < numRanges; ++i) {
+    const auto range = rangeAt(i);
+    // Resume from where the previous call stopped in the first range;
+    // page-align the offset down so the address handed to move_pages stays page
+    // aligned (the boundary page may be re-migrated, which is a no-op).
+    int64_t offset = (i == numMigratedRanges_) ? migratedBytesInRange_ : 0;
+    offset &= ~(pageSize - 1);
+    if (offset >= range.size()) {
+      continue;
+    }
+    numFailed +=
+        migratePages(range.data() + offset, range.size() - offset, numaNode);
+    migratedBytes += range.size() - offset;
+  }
+  // Ranges before the last are full and immutable; only the last can grow, so
+  // resume there next time.
+  if (numRanges > 0) {
+    numMigratedRanges_ = numRanges - 1;
+    migratedBytesInRange_ = rangeAt(numRanges - 1).size();
+  }
+  if (numFailed > 0) {
+    LOG(WARNING) << numFailed << " pages did not migrate to NUMA node "
+                 << numaNode;
+  }
+  return migratedBytes;
 }
 
 char* AllocationPool::allocateFixed(uint64_t bytes, int32_t alignment) {

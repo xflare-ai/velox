@@ -1216,6 +1216,17 @@ void GroupingSet::relocate(memory::MemoryPool* pool) {
   table_->relocatePayload(pool);
 }
 
+int64_t GroupingSet::migrate(int32_t numaNode, bool includeBuckets) {
+  TestValue::adjust("facebook::velox::exec::GroupingSet::migrate", this);
+  // Migration and disk spill are mutually exclusive on a query, matching
+  // relocate(): a later disk spill would not see the migrated placement.
+  VELOX_CHECK(!hasSpilled());
+  if (table_ == nullptr || table_->numDistinct() == 0) {
+    return 0;
+  }
+  return table_->migratePayload(numaNode, includeBuckets);
+}
+
 bool GroupingSet::getOutputWithSpill(
     int32_t maxOutputRows,
     int32_t maxOutputBytes,

@@ -151,6 +151,7 @@ set(
   AsyncConnectorTest.cpp
   VectorWindowPartitionTest.cpp
   HashTableRelocateTest.cpp
+  HashTableMigrateTest.cpp
 )
 
 set(

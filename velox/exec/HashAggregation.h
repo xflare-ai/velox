@@ -35,6 +35,9 @@ class HashAggregation : public Operator {
   /// Number of rows emitted after partial aggregation was abandoned.
   static constexpr std::string_view kAbandonedPartialAggregationRows =
       "abandonedPartialAggregationRows";
+  /// Wall time spent migrating the payload to a memory tier with move_pages,
+  /// in nanoseconds (relocation_mode=migrate).
+  static constexpr std::string_view kMigrateWallNanos = "cxlMigrateWallNanos";
 
   HashAggregation(
       int32_t operatorId,
@@ -81,6 +84,10 @@ class HashAggregation : public Operator {
   memory::MemoryPool* relocationPoolForAggregation(
       const std::vector<std::unique_ptr<VectorHasher>>& hashers,
       const std::vector<AggregateInfo>& aggregateInfos) const;
+
+  // Migrates the payload to 'migrateNumaNode_' in place with move_pages instead
+  // of disk spilling, relieving the DRAM cap and charging the CXL tier budget.
+  void reclaimByMigration(memory::MemoryReclaimer::Stats& stats);
 
   void updateRuntimeStats();
 
@@ -157,6 +164,19 @@ class HashAggregation : public Operator {
   // disk spilling, or nullptr when no tier is configured or the aggregation
   // shape forbids a byte-copy relocation. Set during initialize().
   memory::MemoryPool* relocationPool_{nullptr};
+
+  // When true, reclaim() migrates the payload pages in place with move_pages
+  // (relocation_mode=migrate) instead of the byte-copy relocation.
+  const bool migrateRelocation_;
+  // Target NUMA node for move_pages migration; valid only when
+  // 'migrateRelocation_'.
+  const int32_t migrateNumaNode_;
+  // Whether migration also moves the hash bucket array, not just the payload.
+  const bool migrateBuckets_;
+  // Total bytes migrated with move_pages so far, relieved from 'pool()' via
+  // reportExternalFree() and restored in close() so the payload's eventual
+  // free nets to a single decrement.
+  int64_t migratedBytes_{0};
 
   // Size of a single output row estimated using
   // 'groupingSet_->estimateRowSize()'. If spilling, this value is set to max

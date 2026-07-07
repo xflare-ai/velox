@@ -19,6 +19,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/memory/AllocationPool.h"
 #include "velox/common/memory/CustomMemoryResource.h"
 #include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #include "velox/common/memory/MallocAllocator.h"
@@ -99,6 +100,21 @@ class CxlAggregationRelocateTest : public OperatorTestBase {
     }
     return total;
   }
+
+  // Returns whether move_pages works on this host, so the migrate-mode test can
+  // skip where the syscall is unavailable. Migrating to the local node 0 is a
+  // valid no-op migration everywhere else.
+  static bool movePagesAvailable() {
+    auto pool = memory::memoryManager()->addLeafPool("move-pages-probe");
+    memory::AllocationPool probe(pool.get());
+    *reinterpret_cast<int64_t*>(probe.allocateFixed(4096, 1)) = 1;
+    try {
+      probe.migratePagesToNode(0);
+    } catch (const VeloxException&) {
+      return false;
+    }
+    return true;
+  }
 };
 
 // Under memory arbitration a grouped, fixed-width aggregation reclaims by
@@ -151,6 +167,59 @@ TEST_F(CxlAggregationRelocateTest, relocatesToTierUnderArbitration) {
 
   EXPECT_GT(relocatedBytes(task), 0);
   // Either/or: relocation replaced disk spill, so nothing reached disk.
+  for (const auto& [_, nodeStats] : exec::toPlanStats(task->taskStats())) {
+    EXPECT_EQ(nodeStats.spilledBytes, 0);
+  }
+}
+
+// move_pages relocation: under arbitration reclaim migrates the payload pages
+// in place to a NUMA node (relocation_mode=migrate) instead of byte-copying,
+// leaving virtual addresses and the hash index unchanged. Targets the local
+// node 0 (a valid no-op migration on any Linux host). Migration must relieve
+// the DRAM cap (relocatedMemoryBytes > 0), no disk spill must occur, results
+// must be correct, and the teardown accounting must balance (checked by the
+// base class's pool leak checks).
+TEST_F(CxlAggregationRelocateTest, migratesToTierUnderArbitration) {
+  if (!movePagesAvailable()) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+  constexpr int32_t kFirstBatchRows = 200'000;
+  auto firstBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          kFirstBatchRows,
+          [](auto row) { return static_cast<int64_t>(row); },
+          [](auto row) { return row % 1'000 == 0; }),
+      makeFlatVector<int64_t>(kFirstBatchRows, [](auto row) { return row; }),
+  });
+  auto secondBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          8, [](auto row) { return kFirstBatchRows + row; }),
+      makeFlatVector<int64_t>(8, [](auto row) { return row; }),
+  });
+  std::vector<RowVectorPtr> batches{firstBatch, secondBatch};
+  createDuckDbTable(batches);
+
+  exec::TestScopedSpillInjection injectSpill(
+      /*spillPct=*/100, /*poolRegExp=*/".*", /*maxInjections=*/1);
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  exec::CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .values(batches)
+                        .singleAggregation({"c0"}, {"sum(c1)"})
+                        .planNode();
+  params.queryCtx = makeQueryCtxWithTier("cxl-agg-migrate");
+  params.spillDirectory = spillDirectory->getPath();
+  params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
+      std::string{CxlMemoryResource::kTag};
+  params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
+  params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] = "0";
+  auto task = assertQuery(params, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  EXPECT_GT(relocatedBytes(task), 0);
+  // Either/or: migration replaced disk spill, so nothing reached disk.
   for (const auto& [_, nodeStats] : exec::toPlanStats(task->taskStats())) {
     EXPECT_EQ(nodeStats.spilledBytes, 0);
   }

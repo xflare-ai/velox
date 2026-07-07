@@ -152,6 +152,13 @@ class GroupingSet {
   /// exclusive with disk spill; a no-op if the table is empty.
   void relocate(memory::MemoryPool* pool);
 
+  /// Migrates the in-memory payload pages in place to NUMA node 'numaNode' with
+  /// move_pages instead of spilling to disk, leaving the hash index untouched.
+  /// If 'includeBuckets' is true, also migrates the bucket array. Returns the
+  /// number of bytes migrated. Mutually exclusive with disk spill; a no-op
+  /// (returns 0) if the table is empty.
+  int64_t migrate(int32_t numaNode, bool includeBuckets);
+
   /// Returns the spiller stats including total bytes and rows spilled so far.
   std::optional<exec::SpillStats> spilledStats() const;
 

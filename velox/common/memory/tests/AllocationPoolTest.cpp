@@ -222,3 +222,54 @@ TEST_F(AllocationPoolTest, cloneEmptyAndPreconditions) {
   VELOX_ASSERT_THROW(
       dest.clone(empty), "clone requires an empty destination pool");
 }
+
+TEST_F(AllocationPoolTest, migratePagesToNode) {
+  // move_pages to the local node 0 is a valid no-op migration on any Linux host
+  // (single- or multi-node); the payload's virtual addresses and content stay
+  // put, which is all the migration guarantees. Skip where the syscall is
+  // unavailable.
+  auto probe = std::make_unique<memory::AllocationPool>(pool_.get());
+  char* one = probe->allocateFixed(4096, 1);
+  *reinterpret_cast<int64_t*>(one) = 1;
+  try {
+    probe->migratePagesToNode(0);
+  } catch (const VeloxException&) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+
+  auto source = std::make_unique<memory::AllocationPool>(pool_.get());
+  // Span both small and large (huge-page) runs.
+  source->setHugePageThreshold(128 << 10);
+  constexpr int32_t kChunkBytes = 512;
+  constexpr int32_t kNumChunks = 20'000; // ~10MB, past the threshold.
+  std::vector<char*> chunks;
+  chunks.reserve(kNumChunks);
+  for (int64_t i = 0; i < kNumChunks; ++i) {
+    char* chunk = source->allocateFixed(kChunkBytes, 8);
+    *reinterpret_cast<int64_t*>(chunk) = i;
+    chunks.push_back(chunk);
+  }
+  ASSERT_GT(source->numRanges(), 1) << "test must span multiple runs";
+
+  const int64_t migrated = source->migratePagesToNode(0);
+  // The whole populated extent is migrated on the first call.
+  EXPECT_GE(migrated, static_cast<int64_t>(kNumChunks) * kChunkBytes);
+
+  // Virtual addresses are unchanged and content is intact.
+  for (int64_t i = 0; i < kNumChunks; ++i) {
+    EXPECT_EQ(*reinterpret_cast<int64_t*>(chunks[i]), i);
+  }
+
+  // A second call with no new allocations migrates nothing (incremental).
+  EXPECT_EQ(source->migratePagesToNode(0), 0);
+
+  // Growing the payload migrates only the newly added extent.
+  for (int64_t i = 0; i < kNumChunks; ++i) {
+    char* chunk = source->allocateFixed(kChunkBytes, 8);
+    *reinterpret_cast<int64_t*>(chunk) = kNumChunks + i;
+  }
+  const int64_t migratedAgain = source->migratePagesToNode(0);
+  EXPECT_GT(migratedAgain, 0);
+  EXPECT_LT(migratedAgain, migrated + kChunkBytes * kNumChunks)
+      << "second migration should not re-scan the whole payload";
+}

@@ -878,6 +878,14 @@ class RowContainer {
   std::vector<memory::AllocationPool::Relocation> relocateRunsTo(
       RowContainer& dest);
 
+  /// Migrates the backing pages of the fixed-width payload in place to NUMA
+  /// node 'numaNode' with move_pages, leaving the row addresses (and any hash
+  /// index pointing at them) unchanged. Returns the number of payload bytes
+  /// migrated. Supports only fixed-size rows without external memory
+  /// (variable-width data in the HashStringAllocator is not migrated). Linux
+  /// only.
+  int64_t migrateRowsToNode(int32_t numaNode);
+
   int32_t compareRows(
       const char* left,
       const char* right,

@@ -471,6 +471,13 @@ class BaseHashTable {
   /// otherwise.
   virtual RowContainer* relocatePayload(memory::MemoryPool* pool);
 
+  /// Migrates the payload rows of 'rows()' in place to NUMA node 'numaNode'
+  /// with move_pages, leaving virtual addresses and the index untouched. If
+  /// 'includeBuckets' is true, also migrates the bucket array. Returns the
+  /// number of bytes whose pages were migrated. Same table restrictions as
+  /// relocatePayload().
+  virtual int64_t migratePayload(int32_t numaNode, bool includeBuckets);
+
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
@@ -785,6 +792,8 @@ class HashTable : public BaseHashTable {
   std::vector<RowContainer*> allRows() const override;
 
   RowContainer* relocatePayload(memory::MemoryPool* pool) override;
+
+  int64_t migratePayload(int32_t numaNode, bool includeBuckets) override;
 
   std::string toString() override;
 

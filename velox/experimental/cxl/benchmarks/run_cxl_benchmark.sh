@@ -20,7 +20,12 @@
 #
 #   A  dram        DRAM pool capped, on-disk spill    (swept over DRAM_MB_LIST)
 #   B  interleave  pages striped across DRAM + CXL    (swept over WEIGHTS_LIST)
-#   C  cxl         HashAggregation relocate to CXL    (swept over DRAM_MB_LIST)
+#   C  cxl         HashAggregation copy+repoint to CXL (swept over DRAM_MB_LIST)
+#   D  cxl_migrate HashAggregation move_pages to CXL  (swept over DRAM_MB_LIST)
+#
+# C and D are the A/B: same query and cap, differing only in the relocation
+# mechanism (byte-copy+repoint vs VA-stable page migration). Run both, then
+# compare "cxl relocated" and "cxl migrate wall" against total elapsed.
 #
 # B's ratio sweep uses weighted interleave (MPOL_WEIGHTED_INTERLEAVE, Linux
 # 6.9+, numactl with --weighted-interleave); weights are written to
@@ -40,8 +45,8 @@
 #   DRAM_MB_LIST  DRAM caps in MB to sweep for A and C (default "32 40 48 56",
 #                 sized for the default 1M-group table; rescale with zipf_groups)
 #   WEIGHTS_LIST  dram:cxl interleave weights to sweep for B (default "1:1")
-#   CONFIGS       which configs to run, space-separated subset of "A B C"
-#                 (default "A B C"). E.g. CONFIGS="B C" skips the slow spill leg.
+#   CONFIGS       which configs to run, space-separated subset of "A B C D"
+#                 (default "A B C D"). E.g. CONFIGS="C D" runs just the A/B pair.
 #   EXTRA         extra flags passed through (e.g. --zipf_groups, --zipf_skew)
 #   RUN_LOG       path for the captured run log (default results/zipf-sf<SF>.log)
 #
@@ -57,7 +62,7 @@ DRAM_NODE="${DRAM_NODE:-0}"
 SF="${SF:-1}"
 DRAM_MB_LIST="${DRAM_MB_LIST:-32 40 48 56}"
 WEIGHTS_LIST="${WEIGHTS_LIST:-1:1}"
-CONFIGS="${CONFIGS:-A B C}"
+CONFIGS="${CONFIGS:-A B C D}"
 EXTRA="${EXTRA:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,7 +120,7 @@ set_node_weight() {
 
   failures=0
   for dram_mb in ${DRAM_MB_LIST}; do
-    want_config A || want_config C || break
+    want_config A || want_config C || want_config D || break
 
     if want_config A; then
       echo "######## A: DRAM-only + spill (cap ${dram_mb} MB) ########"
@@ -126,18 +131,30 @@ set_node_weight() {
       fi
     fi
 
-    want_config C || continue
-    echo "######## C: CXL-aware relocate (cap ${dram_mb} MB) ########"
-    # The CXL pool binds itself to CXL_NODE via libnuma; the process compute and
-    # DRAM stay on DRAM_NODE. A failure at a low cap is a legitimate sweep
-    # outcome: the bucket array stays DRAM-pinned, so config C has a hard DRAM
-    # floor that config A (which spills the whole table away) does not.
+    if want_config C; then
+      echo "######## C: CXL copy+repoint relocate (cap ${dram_mb} MB) ########"
+      # The CXL pool binds itself to CXL_NODE via libnuma; the process compute
+      # and DRAM stay on DRAM_NODE. A failure at a low cap is a legitimate sweep
+      # outcome: the bucket array stays DRAM-pinned, so configs C/D have a hard
+      # DRAM floor that config A (which spills the whole table away) does not.
+      if ! numactl --cpunodebind="${DRAM_NODE}" --membind="${DRAM_NODE}" \
+        "${BENCH}" --config=cxl --cxl_numa_node="${CXL_NODE}" \
+        --cxl_capacity_mb="${CXL_MB}" --dram_limit_mb="${dram_mb}" \
+        "${common[@]}"; then
+        echo ">>> LEG FAILED: cxl at ${dram_mb} MB (below the DRAM bucket-array" \
+          "floor, or error above)"
+        failures=$((failures + 1))
+      fi
+    fi
+
+    want_config D || continue
+    echo "######## D: CXL move_pages migrate (cap ${dram_mb} MB) ########"
     if ! numactl --cpunodebind="${DRAM_NODE}" --membind="${DRAM_NODE}" \
-      "${BENCH}" --config=cxl --cxl_numa_node="${CXL_NODE}" \
+      "${BENCH}" --config=cxl_migrate --cxl_numa_node="${CXL_NODE}" \
       --cxl_capacity_mb="${CXL_MB}" --dram_limit_mb="${dram_mb}" \
       "${common[@]}"; then
-      echo ">>> LEG FAILED: cxl at ${dram_mb} MB (below the DRAM bucket-array" \
-        "floor, or error above)"
+      echo ">>> LEG FAILED: cxl_migrate at ${dram_mb} MB (below the DRAM" \
+        "bucket-array floor, or error above)"
       failures=$((failures + 1))
     fi
   done

@@ -52,6 +52,13 @@ RowContainer* BaseHashTable::relocatePayload(memory::MemoryPool* /*pool*/) {
       "relocatePayload is only supported for aggregation hash tables");
 }
 
+int64_t BaseHashTable::migratePayload(
+    int32_t /*numaNode*/,
+    bool /*includeBuckets*/) {
+  VELOX_UNSUPPORTED(
+      "migratePayload is only supported for aggregation hash tables");
+}
+
 template <bool ignoreNullKeys>
 HashTable<ignoreNullKeys>::HashTable(
     std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -1978,6 +1985,24 @@ RowContainer* HashTable<ignoreNullKeys>::relocatePayload(
     rows_->disableNormalizedKeys();
   }
   return addOtherRowContainer(std::move(dest));
+}
+
+template <bool ignoreNullKeys>
+int64_t HashTable<ignoreNullKeys>::migratePayload(
+    int32_t numaNode,
+    bool includeBuckets) {
+  // move_pages keeps virtual addresses stable, so the index needs no repoint:
+  // migrate the backing pages of every row container in place.
+  int64_t migratedBytes = 0;
+  for (auto* container : allRows()) {
+    migratedBytes += container->migrateRowsToNode(numaNode);
+  }
+  if (includeBuckets && tableAllocation_.data() != nullptr) {
+    memory::migratePages(
+        tableAllocation_.data(), tableAllocation_.size(), numaNode);
+    migratedBytes += tableAllocation_.size();
+  }
+  return migratedBytes;
 }
 
 template <bool ignoreNullKeys>

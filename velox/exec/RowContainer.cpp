@@ -1074,6 +1074,13 @@ std::vector<memory::AllocationPool::Relocation> RowContainer::relocateRunsTo(
   return runs;
 }
 
+int64_t RowContainer::migrateRowsToNode(int32_t numaNode) {
+  VELOX_CHECK(
+      !usesExternalMemory_,
+      "migrateRowsToNode supports only fixed-size rows without external memory");
+  return rows_.migratePagesToNode(numaNode);
+}
+
 void RowContainer::setProbedFlag(char** rows, int32_t numRows) {
   const int32_t probedFlagByte = probedFlagOffset_ / 8;
   const uint8_t probedFlagMask = uint8_t{1} << (probedFlagOffset_ & 7);

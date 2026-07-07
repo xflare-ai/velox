@@ -18,6 +18,13 @@
 #include "velox/common/memory/Memory.h"
 
 namespace facebook::velox::memory {
+
+/// Migrates the backing pages of [addr, addr + numBytes) in place to NUMA node
+/// 'numaNode' with the move_pages syscall, leaving the virtual addresses
+/// unchanged. 'addr' must be page aligned. Returns the number of pages not
+/// resident on 'numaNode' afterwards. Linux only.
+int64_t migratePages(void* addr, int64_t numBytes, int32_t numaNode);
+
 /// A set of Allocations holding the fixed width payload ows. The Runs are
 /// filled to the end except for the last one. This is used for iterating over
 /// the payload for rehashing, returning results etc. This is used via
@@ -52,6 +59,15 @@ class AllocationPool {
   /// repoint them. Used to relocate a fixed-width payload into another memory
   /// pool (e.g. a far-memory tier) without rebuilding it row by row.
   std::vector<Relocation> clone(const AllocationPool& src);
+
+  /// Migrates the backing pages of the runs populated since the previous call
+  /// in place to NUMA node 'numaNode' with the move_pages syscall, leaving
+  /// virtual addresses unchanged (so pointers into the payload stay valid).
+  /// Incremental: repeated calls migrate only the newly grown extent, so a run
+  /// is never re-migrated. Returns the number of payload bytes migrated by this
+  /// call. Linux only; used to relocate a fixed-width payload to a far-memory
+  /// tier without copying it.
+  int64_t migratePagesToNode(int32_t numaNode);
 
   // Allocate a buffer from this pool, optionally aligned.  The alignment can
   // only be power of 2.
@@ -174,6 +190,14 @@ class AllocationPool {
 
   // Start using large mmaps with huge pages after 'usedBytes_' exceeds this.
   int64_t hugePageThreshold_{kDefaultHugePageThreshold};
+
+  // Number of leading ranges already fully migrated by migratePagesToNode().
+  // These are immutable (only the last range grows), so they are skipped on
+  // later calls.
+  int32_t numMigratedRanges_{0};
+  // Bytes of range 'numMigratedRanges_' already migrated, i.e. the extent of
+  // the then-current run at the previous migratePagesToNode() call.
+  int64_t migratedBytesInRange_{0};
 };
 
 } // namespace facebook::velox::memory

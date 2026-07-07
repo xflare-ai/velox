@@ -412,6 +412,18 @@ Spilling
      - string
      -
      - Tag of a custom memory resource pool that a grouped aggregation relocates its payload into during reclaim instead of spilling to disk. Empty (default) disables relocation. The tag must be registered with the query via CustomMemoryResourceRegistry.
+   * - relocation_mode
+     - string
+     - copy
+     - Relocation mechanism for grouped aggregation reclaim into the tier named by `relocation_resource_tag`. ``copy`` byte-copies the payload into the tier pool and repoints the hash index. ``migrate`` migrates the backing pages in place to `relocation_migrate_numa_node` with move_pages, leaving virtual addresses and the index unchanged.
+   * - relocation_migrate_numa_node
+     - integer
+     - -1
+     - NUMA node that ``migrate`` relocation moves aggregation payload pages onto. Required when `relocation_mode` is ``migrate``.
+   * - relocation_migrate_include_buckets
+     - boolean
+     - false
+     - Whether ``migrate`` relocation also migrates the hash bucket array in addition to the row payload. False keeps the bucket array in DRAM, matching ``copy`` mode's scope.
    * - join_spill_enabled
      - boolean
      - true

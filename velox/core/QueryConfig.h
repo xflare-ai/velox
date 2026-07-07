@@ -591,6 +591,45 @@ class QueryConfig {
       "relocates its payload into during reclaim instead of spilling to disk. "
       "Empty (default) disables relocation.")
 
+  /// Relocation mechanism a grouped aggregation uses when reclaiming into the
+  /// tier named by 'relocation_resource_tag'. "copy" byte-copies the payload
+  /// into the tier pool and repoints the hash index. "migrate" migrates the
+  /// backing pages in place to 'relocation_migrate_numa_node' with move_pages,
+  /// leaving the virtual addresses and the index unchanged. Ignored when
+  /// relocation is disabled.
+  VELOX_QUERY_CONFIG(
+      kRelocationMode,
+      relocationMode,
+      "relocation_mode",
+      std::string,
+      "copy",
+      "Relocation mechanism for grouped aggregation reclaim: 'copy' or "
+      "'migrate'. See relocation_resource_tag.")
+
+  /// Target NUMA node that "migrate" relocation moves the aggregation payload
+  /// pages onto. Required when 'relocation_mode' is "migrate"; -1 (default)
+  /// leaves it unset.
+  VELOX_QUERY_CONFIG(
+      kRelocationMigrateNumaNode,
+      relocationMigrateNumaNode,
+      "relocation_migrate_numa_node",
+      int32_t,
+      -1,
+      "NUMA node that 'migrate' relocation moves aggregation payload pages "
+      "onto. Required when relocation_mode is 'migrate'.")
+
+  /// Whether "migrate" relocation also migrates the hash bucket array in
+  /// addition to the row payload. False (default) keeps the bucket array in
+  /// DRAM, matching the "copy" mode's scope.
+  VELOX_QUERY_CONFIG(
+      kRelocationMigrateIncludeBuckets,
+      relocationMigrateIncludeBuckets,
+      "relocation_migrate_include_buckets",
+      bool,
+      false,
+      "Whether 'migrate' relocation also migrates the hash bucket array in "
+      "addition to the row payload.")
+
   /// Join spilling flag, only applies if "spill_enabled" flag is set.
   VELOX_QUERY_CONFIG(
       kJoinSpillEnabled,

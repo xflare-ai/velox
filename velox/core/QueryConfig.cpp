@@ -112,6 +112,9 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kSpillEnabled);
     VELOX_REGISTER_QUERY_CONFIG(kAggregationSpillEnabled);
     VELOX_REGISTER_QUERY_CONFIG(kRelocationResourceTag);
+    VELOX_REGISTER_QUERY_CONFIG(kRelocationMode);
+    VELOX_REGISTER_QUERY_CONFIG(kRelocationMigrateNumaNode);
+    VELOX_REGISTER_QUERY_CONFIG(kRelocationMigrateIncludeBuckets);
     VELOX_REGISTER_QUERY_CONFIG(kJoinSpillEnabled);
     VELOX_REGISTER_QUERY_CONFIG(kMixedGroupedModeHashJoinSpillEnabled);
     VELOX_REGISTER_QUERY_CONFIG(kOrderBySpillEnabled);

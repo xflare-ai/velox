@@ -27,7 +27,24 @@ run. Every config is apples-to-apples in one process.
 | --- | --- | --- |
 | `--config=dram` | A — no-CXL competitor | DRAM pool capped; on-disk spill |
 | `--config=interleave` | B — OS striping | DRAM+CXL interleaved by `numactl` |
-| `--config=cxl` | C — ours | DRAM capped; relocate overflow to CXL |
+| `--config=cxl` | C — copy+repoint | DRAM capped; byte-copy overflow to CXL |
+| `--config=cxl_migrate` | D — move_pages | DRAM capped; migrate overflow pages to CXL |
+
+C and D are the A/B for the relocation mechanism: same plan, cap, and input,
+differing only in how overflow reaches CXL. C byte-copies the payload into the
+CXL pool and repoints the hash index; D (`relocation_mode=migrate`) migrates the
+backing pages in place with `move_pages`, leaving virtual addresses and the
+index unchanged. D reports `cxl migrate wall` (the move_pages time); compare it
+and total elapsed against C to see whether copy+repoint's edge on the
+microbenchmark holds on the real `HashTable` and at multi-driver (`--num_drivers`,
+where migration's TLB-shootdown / kernel-lock cost scales with cores). D requires
+`--cxl_numa_node`; add `--migrate_buckets` to also migrate the bucket array.
+
+Because `move_pages` relocates physical pages but leaves the allocations owned by
+the DRAM pool, D relieves the DRAM cap during reclaim with `reportExternalFree`
+and restores the accounting at operator close under a lifted cap — VA-stable
+migration does not fit Velox's per-pool byte-cap arbitration as cleanly as the
+copy path, which is itself a result worth noting.
 
 A and C share the same DRAM cap (`--dram_limit_mb`), differing only in overflow
 target (disk vs CXL); the driver script sweeps the cap (`DRAM_MB_LIST`) so the
@@ -96,8 +113,23 @@ EXTRA="--zipf_groups=1000000 --zipf_skew=1.0" \
 ```
 
 This sweeps the interleave ratio over `WEIGHTS_LIST` for config B, then the DRAM
-cap over `DRAM_MB_LIST` for the `dram` and `cxl` configs. Or run a single config
-directly:
+cap over `DRAM_MB_LIST` for the `dram`, `cxl`, and `cxl_migrate` configs (A, C,
+D). Restrict the set with `CONFIGS`; e.g. `CONFIGS="C D"` runs just the
+copy-vs-migrate A/B and skips the slow spill and interleave legs.
+
+To A/B copy vs move_pages across driver counts (the multi-driver comparison the
+maintainer asked for), sweep `--num_drivers` via `EXTRA`:
+
+```bash
+for nd in 1 4 8 16; do
+  BENCH=... CXL_NODE=2 DRAM_NODE=0 SF=1 CONFIGS="C D" \
+  DRAM_MB_LIST="48" CXL_MB=4096 \
+  EXTRA="--zipf_groups=1000000 --zipf_skew=1.0 --num_drivers=${nd}" \
+    ./run_cxl_benchmark.sh
+done
+```
+
+Or run a single config directly. Copy+repoint (C):
 
 ```bash
 numactl --cpunodebind=0 --membind=0 \
@@ -105,9 +137,21 @@ numactl --cpunodebind=0 --membind=0 \
   --cxl_capacity_mb=4096 --dram_limit_mb=48
 ```
 
+move_pages migration (D) — same flags, plus optional `--migrate_buckets` to also
+migrate the bucket array:
+
+```bash
+numactl --cpunodebind=0 --membind=0 \
+  ./velox_cxl_aggregation_benchmark --config=cxl_migrate --cxl_numa_node=2 \
+  --cxl_capacity_mb=4096 --dram_limit_mb=48 --num_drivers=8
+```
+
 Each run reports median elapsed time plus an aggregation-operator breakdown (CPU,
-wall, blocked, peak), spill bytes/time (config A), CXL relocations (config C),
-and a result row count + checksum.
+wall, blocked, peak), spill bytes/time (config A), CXL relocated bytes (C and D),
+the move_pages wall time (`cxl migrate wall`, D only), and a result row count +
+checksum. Compare C's total elapsed and relocated bytes against D's total elapsed
+and migrate wall to see whether copy+repoint's microbenchmark edge holds on the
+real `HashTable` and as `--num_drivers` grows.
 
 ## Reading the results
 
@@ -135,7 +179,8 @@ scripts/summarize.sh results/zipf-sf1.log
 ## Tuning: the DRAM cap has a floor
 
 Relocation moves row payload to CXL, but the bucket array (`table_`) stays pinned
-in DRAM by design. So `--dram_limit_mb` must sit **above** the bucket-array floor
+in DRAM by design (both C and D; D migrates it too only with `--migrate_buckets`).
+So `--dram_limit_mb` must sit **above** the bucket-array floor
 (the index has to fit) yet **below** the whole group table (or no overflow is
 forced). Both scale with `--zipf_groups`. The figures below are starting points; read the
 measured `peak` off a `dram` leg with a large `--dram_limit_mb` (the uncapped
@@ -156,11 +201,13 @@ groups only the first `rows` ranks would be emitted, shrinking the table.
 `CXL_MB` must hold the relocated payload (whole table minus the DRAM cap), so
 size it to the CXL device.
 
-A cap below the floor is a legitimate `LEG FAILED` for config C (the bucket array
-alone will not fit), not a bug.
+A cap below the floor is a legitimate `LEG FAILED` for configs C and D (the
+bucket array alone will not fit), not a bug.
 
 The benchmark must use the **real** NUMA-bound CXL pool (it fails if
-`--cxl_numa_node`/`--cxl_capacity_mb` are unset for `--config=cxl`); never wire
-it to the unit tests' `MallocAllocator` resource, which is DRAM-speed and would
-make C's numbers meaningless. `--cxl_capacity_mb` is pre-reserved by the
-allocator, so size it to the device.
+`--cxl_numa_node`/`--cxl_capacity_mb` are unset for `--config=cxl` or
+`--config=cxl_migrate`); never wire it to the unit tests' `MallocAllocator`
+resource, which is DRAM-speed and would make C's and D's numbers meaningless.
+`--cxl_capacity_mb` is pre-reserved by the allocator, so size it to the device.
+For D, `--cxl_numa_node` is also the `move_pages` migration target, so it must be
+the CXL device's node.

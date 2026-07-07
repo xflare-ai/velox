@@ -15,9 +15,13 @@
  */
 #include "velox/exec/HashAggregation.h"
 
+#include <mutex>
 #include <optional>
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/memory/MemoryArbitrator.h"
+#include "velox/common/memory/MemoryPool.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/common/time/Timer.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
@@ -62,7 +66,12 @@ HashAggregation::HashAggregation(
       abandonPartialAggregationMinPct_(
           driverCtx->queryConfig().abandonPartialAggregationMinPct()),
       maxPartialAggregationMemoryUsage_(
-          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+          driverCtx->queryConfig().maxPartialAggregationMemoryUsage()),
+      migrateRelocation_(
+          driverCtx->queryConfig().relocationMode() == "migrate"),
+      migrateNumaNode_(driverCtx->queryConfig().relocationMigrateNumaNode()),
+      migrateBuckets_(
+          driverCtx->queryConfig().relocationMigrateIncludeBuckets()) {}
 
 memory::MemoryPool* HashAggregation::relocationPoolForAggregation(
     const std::vector<std::unique_ptr<VectorHasher>>& hashers,
@@ -146,6 +155,12 @@ void HashAggregation::initialize() {
   }
 
   relocationPool_ = relocationPoolForAggregation(hashers, aggregateInfos);
+  if (relocationPool_ != nullptr && migrateRelocation_) {
+    VELOX_USER_CHECK_GE(
+        migrateNumaNode_,
+        0,
+        "relocation_mode=migrate requires relocation_migrate_numa_node");
+  }
 
   groupingSet_ = std::make_unique<GroupingSet>(
       inputType,
@@ -624,17 +639,21 @@ void HashAggregation::reclaim(
     // Relocate to the memory tier instead of disk spilling. Skip during output
     // draining: moving rows would re-emit already-output groups.
     if (!noMoreInput_) {
-      // Disk-spill fallback on tier exhaustion is not implemented.
-      if (!relocationPool_->maybeReserve(targetBytes)) {
-        VELOX_NYI(
-            "Disk-spill fallback on memory-tier exhaustion is not implemented; "
-            "size the tier and DRAM so the relocated rows fit");
+      if (migrateRelocation_) {
+        reclaimByMigration(stats);
+      } else {
+        // Disk-spill fallback on tier exhaustion is not implemented.
+        if (!relocationPool_->maybeReserve(targetBytes)) {
+          VELOX_NYI(
+              "Disk-spill fallback on memory-tier exhaustion is not implemented; "
+              "size the tier and DRAM so the relocated rows fit");
+        }
+        memory::recordRelocatedBytes(pool(), [&] {
+          groupingSet_->relocate(relocationPool_);
+          pool()->release();
+        });
+        relocationPool_->release();
       }
-      memory::recordRelocatedBytes(pool(), [&] {
-        groupingSet_->relocate(relocationPool_);
-        pool()->release();
-      });
-      relocationPool_->release();
     }
     return;
   }
@@ -676,11 +695,70 @@ void HashAggregation::reclaim(
   pool()->release();
 }
 
-void HashAggregation::close() {
-  Operator::close();
+void HashAggregation::reclaimByMigration(
+    memory::MemoryReclaimer::Stats& stats) {
+  // move_pages keeps virtual addresses stable and does not change pool
+  // accounting, so relieve the DRAM cap explicitly (reportExternalFree) and
+  // charge the migrated bytes to the CXL tier budget
+  // (reportExternalAllocation). Both are reversed in close() so the payload's
+  // eventual free stays balanced.
+  uint64_t wallNanos{0};
+  int64_t moved{0};
+  memory::recordRelocatedBytes(pool(), [&] {
+    NanosecondTimer timer(&wallNanos);
+    moved = groupingSet_->migrate(migrateNumaNode_, migrateBuckets_);
+    if (moved > 0) {
+      pool()->reportExternalFree(moved);
+      relocationPool_->reportExternalAllocation(moved);
+      migratedBytes_ += moved;
+    }
+  });
+  if (moved > 0) {
+    stats.reclaimedBytes += moved;
+    addThreadLocalRuntimeStat(
+        kMigrateWallNanos,
+        RuntimeCounter(wallNanos, RuntimeCounter::Unit::kNanos));
+  }
+}
 
+void HashAggregation::close() {
+  if (migratedBytes_ == 0) {
+    Operator::close();
+    output_ = nullptr;
+    groupingSet_.reset();
+    return;
+  }
+
+  // move_pages left the migrated allocations owned by 'pool()', so their free
+  // during teardown must be balanced against the reportExternalFree() that
+  // relieved the DRAM cap in reclaimByMigration(). Re-accounting migratedBytes_
+  // pushes the pool above its arbitration cap (the payload is larger than the
+  // cap by design), which VA-stable migration cannot avoid, so lift the cap for
+  // the teardown window. Serialized across drivers (they share the root pool)
+  // and restored so root-pool destruction returns the correct capacity to the
+  // arbitrator.
+  static std::mutex teardownMutex;
+  std::lock_guard<std::mutex> l(teardownMutex);
+  auto* root = static_cast<memory::MemoryPoolImpl*>(pool()->root());
+  const int64_t savedCapacity = root->capacity();
+  // reservationBytes_ <= capacity_ outside arbitration, so a cap of
+  // savedCapacity + migratedBytes_ makes the reserve below fit without
+  // triggering arbitration. Guard against overflow when capacity is unlimited.
+  const int64_t liftedCapacity =
+      savedCapacity > memory::kMaxMemory - migratedBytes_
+      ? memory::kMaxMemory
+      : savedCapacity + migratedBytes_;
+  root->testingSetCapacity(liftedCapacity);
+  pool()->reportExternalAllocation(migratedBytes_);
+  relocationPool_->reportExternalFree(migratedBytes_);
+  migratedBytes_ = 0;
+
+  Operator::close();
   output_ = nullptr;
+  // Frees the payload; its release() brings the reservation back below
+  // savedCapacity before the cap is restored.
   groupingSet_.reset();
+  root->testingSetCapacity(savedCapacity);
 }
 
 void HashAggregation::updateEstimatedOutputRowSize() {

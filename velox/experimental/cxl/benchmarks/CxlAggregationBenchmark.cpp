@@ -35,13 +35,21 @@
 //                       pages across DRAM and CXL.
 //   --config=cxl        HashAggregation with a real CXL tier pool registered on
 //                       the query (customPool "cxl"); DRAM pool capped (same as
-//                       'dram'). Under pressure reclaim() relocates the payload
-//                       to CXL instead of disk spilling (either/or); if the CXL
-//                       pool is exhausted the query fails rather than spilling.
+//                       'dram'). Under pressure reclaim() byte-copies the
+//                       payload to CXL instead of disk spilling (either/or); if
+//                       the CXL pool is exhausted the query fails rather than
+//                       spilling.
+//   --config=cxl_migrate Same as 'cxl', but reclaim() relocates by migrating
+//   the
+//                       payload pages in place to the CXL node with move_pages
+//                       (relocation_mode=migrate), leaving virtual addresses
+//                       and the hash index unchanged. A/B against 'cxl' to
+//                       compare copy+repoint vs VA-stable page migration on the
+//                       real HashTable, single- and multi-driver.
 //
 // Each config is meant to run as a separate process (the numactl policy differs
-// per config, and the 'cxl' config registers a per-query CXL tier pool). See
-// run_cxl_benchmark.sh.
+// per config, and the 'cxl'/'cxl_migrate' configs register a per-query CXL tier
+// pool). See run_cxl_benchmark.sh.
 
 #include <algorithm>
 #include <cmath>
@@ -76,7 +84,7 @@
 DEFINE_string(
     config,
     "dram",
-    "Placement configuration: dram | interleave | cxl.");
+    "Placement configuration: dram | interleave | cxl | cxl_migrate.");
 DEFINE_int64(zipf_groups, 1'000'000, "Number of distinct grouping keys.");
 DEFINE_double(
     zipf_skew,
@@ -113,6 +121,11 @@ DEFINE_string(
     spill_dir,
     "/tmp/cxl_bench_spill",
     "Spill directory for 'dram' and 'cxl'.");
+DEFINE_bool(
+    migrate_buckets,
+    false,
+    "For --config=cxl_migrate, also migrate the hash bucket array to CXL, not "
+    "just the row payload.");
 
 using namespace facebook::velox;
 using exec::test::PlanBuilder;
@@ -136,17 +149,32 @@ struct TrialMetrics {
   // summed from the relocatedMemoryBytes runtime stat. Recorded in release
   // builds too.
   uint64_t relocatedBytes{0};
+  // Wall time spent in move_pages migration during reclaim (cxl_migrate),
+  // summed from the cxlMigrateWallNanos runtime stat.
+  uint64_t migrateWallNanos{0};
   int64_t resultRows{0};
   uint64_t checksum{0};
 };
 
-bool isCxlConfig() {
+// The byte-copy relocation config.
+bool isCxlCopyConfig() {
   return FLAGS_config == "cxl";
+}
+
+// The move_pages in-place migration config.
+bool isCxlMigrateConfig() {
+  return FLAGS_config == "cxl_migrate";
+}
+
+// Both configs relocate into a CXL tier pool during reclaim and share the pool
+// setup; they differ only in the relocation mechanism.
+bool usesCxlTier() {
+  return isCxlCopyConfig() || isCxlMigrateConfig();
 }
 
 // Caps the query's DRAM pool for the configs that must feel memory pressure.
 int64_t dramCapacityBytes() {
-  if (FLAGS_config == "dram" || FLAGS_config == "cxl") {
+  if (FLAGS_config == "dram" || usesCxlTier()) {
     return FLAGS_dram_limit_mb << 20;
   }
   return memory::kMaxMemory;
@@ -241,6 +269,8 @@ void collectOperatorStats(const exec::TaskStats& stats, TrialMetrics& metrics) {
             runtimeSum(op.runtimeStats, "spillReadWallNanos");
         metrics.relocatedBytes +=
             runtimeSum(op.runtimeStats, memory::kRelocatedMemoryBytes);
+        metrics.migrateWallNanos +=
+            runtimeSum(op.runtimeStats, "cxlMigrateWallNanos");
       }
     }
   }
@@ -370,7 +400,7 @@ TrialMetrics runTrial(
       core::QueryCtx::Builder().executor(executor).pool(rootPool).queryId(
           queryId);
 
-  if (isCxlConfig()) {
+  if (usesCxlTier()) {
     cxlResource = cxl::CxlMemoryResource::create(
         FLAGS_cxl_numa_node, FLAGS_cxl_capacity_mb << 20);
     auto cxlPool = manager->addCustomRootPool(queryId + ".cxl", cxlResource);
@@ -379,7 +409,7 @@ TrialMetrics runTrial(
   }
 
   auto queryCtx = builder.build();
-  if (isCxlConfig()) {
+  if (usesCxlTier()) {
     auto registry =
         memory::CustomMemoryResourceRegistry::createRegistry(nullptr);
     queryCtx->setRegistry<memory::CustomMemoryResourceRegistry::Registry>(
@@ -393,15 +423,24 @@ TrialMetrics runTrial(
   params.maxDrivers = std::max(1, FLAGS_num_drivers);
   params.copyResult = true;
 
-  if (FLAGS_config == "dram" || isCxlConfig()) {
+  if (FLAGS_config == "dram" || usesCxlTier()) {
     params.spillDirectory = FLAGS_spill_dir;
     params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
     params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
   }
-  if (isCxlConfig()) {
+  if (usesCxlTier()) {
     // Route reclaim to the "cxl" tier pool registered above instead of disk.
     params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
         std::string{cxl::CxlMemoryResource::kTag};
+  }
+  if (isCxlMigrateConfig()) {
+    // Relocate by migrating the payload pages in place with move_pages to the
+    // CXL node, instead of the byte-copy relocation.
+    params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
+    params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] =
+        std::to_string(FLAGS_cxl_numa_node);
+    params.queryConfigs[core::QueryConfig::kRelocationMigrateIncludeBuckets] =
+        FLAGS_migrate_buckets ? "true" : "false";
   }
 
   auto [cursor, results] = exec::test::readCursor(
@@ -441,7 +480,7 @@ void report(const std::vector<TrialMetrics>& trials) {
                    FLAGS_dram_limit_mb,
                    trials.size())
             << "\n";
-  if (isCxlConfig()) {
+  if (usesCxlTier()) {
     std::cout << fmt::format(
                      "cxl_numa_node={} cxl_capacity_mb={}",
                      FLAGS_cxl_numa_node,
@@ -457,7 +496,7 @@ void report(const std::vector<TrialMetrics>& trials) {
       last.aggBlockedNanos / 1e6,
       last.aggPeakBytes / static_cast<double>(1 << 20));
   // On 'cxl' a non-zero figure means the CXL pool overflowed to disk.
-  if (FLAGS_config == "dram" || isCxlConfig()) {
+  if (FLAGS_config == "dram" || usesCxlTier()) {
     std::cout << fmt::format(
         "spill: bytes={:.1f} MB rows={} write={:.1f} ms read={:.1f} ms\n",
         last.spilledBytes / static_cast<double>(1 << 20),
@@ -465,10 +504,14 @@ void report(const std::vector<TrialMetrics>& trials) {
         last.spillWriteNanos / 1e6,
         last.spillReadNanos / 1e6);
   }
-  if (isCxlConfig()) {
+  if (usesCxlTier()) {
     std::cout << fmt::format(
         "cxl relocated: {:.1f} MB\n",
         last.relocatedBytes / static_cast<double>(1 << 20));
+    if (isCxlMigrateConfig()) {
+      std::cout << fmt::format(
+          "cxl migrate wall: {:.1f} ms\n", last.migrateWallNanos / 1e6);
+    }
     if (last.relocatedBytes == 0) {
       std::cout << "WARNING: no relocation fired; the DRAM cap did not trigger "
                    "the arbitrator. Lower --dram_limit_mb or verify the CXL "
@@ -492,14 +535,16 @@ int main(int argc, char** argv) {
     LOG(ERROR) << "--zipf_groups must be > 0.";
     return 1;
   }
-  if (isCxlConfig() && FLAGS_cxl_numa_node < 0) {
-    LOG(ERROR) << "--config=cxl requires --cxl_numa_node to be set to the CXL "
-                  "device's NUMA node id.";
+  if (usesCxlTier() && FLAGS_cxl_numa_node < 0) {
+    LOG(ERROR) << "--config=" << FLAGS_config
+               << " requires --cxl_numa_node to be set to the CXL device's "
+                  "NUMA node id.";
     return 1;
   }
-  if (isCxlConfig() && FLAGS_cxl_capacity_mb <= 0) {
-    LOG(ERROR) << "--config=cxl requires --cxl_capacity_mb > 0; the CXL "
-                  "allocator pre-reserves this capacity.";
+  if (usesCxlTier() && FLAGS_cxl_capacity_mb <= 0) {
+    LOG(ERROR) << "--config=" << FLAGS_config
+               << " requires --cxl_capacity_mb > 0; the CXL allocator "
+                  "pre-reserves this capacity.";
     return 1;
   }
 
