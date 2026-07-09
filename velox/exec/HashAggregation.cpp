@@ -724,9 +724,28 @@ void HashAggregation::reclaimByMigration(
     NanosecondTimer timer(&wallNanos);
     moved = groupingSet_->migrate(migrateNumaNode_, migrateBuckets_);
     if (moved > 0) {
+      // Relieve the DRAM cap and record the relief before charging the tier, so
+      // restoreMigrationAccounting() reverses it before the payload is freed
+      // even if the tier charge fails.
       pool()->reportExternalFree(moved);
-      relocationPool_->reportExternalAllocation(moved);
       migratedBytes_ += moved;
+      // Charge the CXL tier budget. The pages already moved with move_pages, so
+      // exceeding the tier's logical budget is not fatal: charging is
+      // best-effort. Propagating the exception would abort the pool with the
+      // DRAM relief already applied, so swallow it and track only what was
+      // charged; restoreMigrationAccounting() releases no more than that.
+      try {
+        TestValue::adjust(
+            "facebook::velox::exec::HashAggregation::reclaimByMigration::tierCharge",
+            this);
+        relocationPool_->reportExternalAllocation(moved);
+        tierChargedBytes_ += moved;
+      } catch (const VeloxException& e) {
+        LOG(WARNING) << "CXL tier budget charge of " << moved
+                     << " bytes failed during migration; the pages moved but "
+                        "the tier accounting is now under-counted: "
+                     << e.what();
+      }
     }
   });
   if (moved > 0) {
@@ -759,7 +778,12 @@ void HashAggregation::restoreMigrationAccounting() {
   root->testingSetCapacity(liftedCapacity);
   liftedCapacityBytes_ += liftedCapacity - capacity;
   pool()->reportExternalAllocation(migratedBytes_);
-  relocationPool_->reportExternalFree(migratedBytes_);
+  // Release only the bytes that actually reached the tier; a failed tier charge
+  // during reclaim relieves the DRAM cap without charging the tier.
+  if (tierChargedBytes_ > 0) {
+    relocationPool_->reportExternalFree(tierChargedBytes_);
+    tierChargedBytes_ = 0;
+  }
   migratedBytes_ = 0;
 }
 

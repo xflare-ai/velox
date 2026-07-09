@@ -190,6 +190,10 @@ class HashAggregation : public Operator {
   // yet been reversed. Reset to zero by restoreMigrationAccounting() once the
   // relief is re-charged to 'pool()'.
   int64_t migratedBytes_{0};
+  // Bytes actually charged to the tier ('relocationPool_') for the migrated
+  // payload. May be less than 'migratedBytes_' when a tier charge fails, so the
+  // reversal in restoreMigrationAccounting() releases no more than was charged.
+  int64_t tierChargedBytes_{0};
   // Bytes by which restoreMigrationAccounting() lifted the shared root cap,
   // pending restoration by lowerMigrationCapacity() after the payload is freed.
   int64_t liftedCapacityBytes_{0};

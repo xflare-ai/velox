@@ -25,6 +25,7 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/memory/MemoryArbitrator.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Cursor.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -304,6 +305,69 @@ TEST_F(
     GTEST_SKIP() << "move_pages not available on this host";
   }
   runRepeatedMigration("cxl-agg-migrate-buckets", /*includeBuckets=*/true);
+}
+
+// A migration whose CXL tier budget charge fails mid-reclaim must neither crash
+// nor fail the query. reclaimByMigration() relieves the DRAM cap
+// (reportExternalFree) and then charges the tier budget
+// (reportExternalAllocation), which throws when the tier is exhausted -- what
+// benchmark config D hits. On the buggy path the relief is applied but the
+// bytes go untracked, the exception aborts the pool, and the payload's teardown
+// free drives the leaf reservation below zero (a 2^64 unsigned wrap). The fix
+// records the relief before the charge and treats the charge as best-effort
+// (the pages already moved physically), so the query completes and teardown
+// balances. Injected with a debug-only TestValue on the first migration.
+TEST_F(CxlAggregationRelocateTest, migrateToleratesTierChargeFailure) {
+  if (!movePagesAvailable()) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+  constexpr int32_t kFirstBatchRows = 200'000;
+  auto firstBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          kFirstBatchRows, [](auto row) { return static_cast<int64_t>(row); }),
+      makeFlatVector<int64_t>(kFirstBatchRows, [](auto row) { return row; }),
+  });
+  auto secondBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          8, [](auto row) { return kFirstBatchRows + row; }),
+      makeFlatVector<int64_t>(8, [](auto row) { return row; }),
+  });
+  std::vector<RowVectorPtr> batches{firstBatch, secondBatch};
+  createDuckDbTable(batches);
+
+  exec::TestScopedSpillInjection injectSpill(
+      /*spillPct=*/100, /*poolRegExp=*/".*", /*maxInjections=*/1);
+
+  // Fail the tier budget charge on the first migration, mimicking a full CXL
+  // tier. reportExternalFree() has already relieved the DRAM cap when this
+  // fires, so the relief must survive to be reversed at teardown.
+  std::atomic_int migrations{0};
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::exec::HashAggregation::reclaimByMigration::tierCharge",
+      std::function<void(void*)>([&](void*) {
+        if (migrations.fetch_add(1) == 0) {
+          VELOX_FAIL("injected CXL tier exhaustion");
+        }
+      }));
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  exec::CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .values(batches)
+                        .singleAggregation({"c0"}, {"sum(c1)"})
+                        .planNode();
+  params.queryCtx = makeQueryCtxWithTier("cxl-agg-tier-charge-fails");
+  params.spillDirectory = spillDirectory->getPath();
+  params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
+      std::string{CxlMemoryResource::kTag};
+  params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
+  params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] = "0";
+  // The query completes with correct results despite the injected tier
+  // exhaustion; the base class's pool leak checks assert the teardown balance.
+  auto task = assertQuery(params, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+  EXPECT_GT(relocatedBytes(task), 0);
 }
 
 // Relocation does not depend on disk spill. With only 'relocation_resource_tag'
