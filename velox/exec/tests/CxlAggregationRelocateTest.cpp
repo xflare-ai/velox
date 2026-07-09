@@ -101,6 +101,13 @@ class CxlAggregationRelocateTest : public OperatorTestBase {
     return total;
   }
 
+  // Drives an aggregation that fires reclaim on every one of many batches in
+  // migrate mode, so the DRAM/tier accounting is exercised across many reclaims
+  // (and rehashes) plus teardown. 'includeBuckets' also migrates the bucket
+  // array. Asserts relocation fired and nothing spilled to disk; the base
+  // class's pool leak checks assert the accounting balances.
+  void runRepeatedMigration(const std::string& queryId, bool includeBuckets);
+
   // Returns whether move_pages works on this host, so the migrate-mode test can
   // skip where the syscall is unavailable. Migrating to the local node 0 is a
   // valid no-op migration everywhere else.
@@ -223,6 +230,80 @@ TEST_F(CxlAggregationRelocateTest, migratesToTierUnderArbitration) {
   for (const auto& [_, nodeStats] : exec::toPlanStats(task->taskStats())) {
     EXPECT_EQ(nodeStats.spilledBytes, 0);
   }
+}
+
+// Repeated reclaim in migrate mode: the benchmark's config D fires reclaim many
+// times as the table grows under a tight DRAM cap, not once. Each reclaim
+// migrates only the newly grown extent and adjusts the DRAM/tier accounting;
+// after many reclaims plus teardown the base class's pool leak checks must
+// still balance. Reproduces the config-D double-accounting failure.
+void CxlAggregationRelocateTest::runRepeatedMigration(
+    const std::string& queryId,
+    bool includeBuckets) {
+  // Many batches of distinct keys so the table grows across many addInput
+  // calls, and reclaim fires on each. Row width (key + sum accumulator) makes
+  // the used extent not page-aligned at reclaim time, exercising the
+  // incremental resume.
+  constexpr int32_t kNumBatches = 16;
+  constexpr int32_t kBatchRows = 50'000;
+  std::vector<RowVectorPtr> batches;
+  batches.reserve(kNumBatches);
+  for (int32_t batch = 0; batch < kNumBatches; ++batch) {
+    const int64_t base = static_cast<int64_t>(batch) * kBatchRows;
+    batches.push_back(makeRowVector({
+        makeFlatVector<int64_t>(
+            kBatchRows, [&](auto row) { return base + row; }),
+        makeFlatVector<int64_t>(kBatchRows, [](auto row) { return row; }),
+    }));
+  }
+  createDuckDbTable(batches);
+
+  exec::TestScopedSpillInjection injectSpill(
+      /*spillPct=*/100, /*poolRegExp=*/".*", /*maxInjections=*/kNumBatches);
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  exec::CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .values(batches)
+                        .singleAggregation({"c0"}, {"sum(c1)"})
+                        .planNode();
+  params.queryCtx = makeQueryCtxWithTier(queryId);
+  params.spillDirectory = spillDirectory->getPath();
+  params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
+      std::string{CxlMemoryResource::kTag};
+  params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
+  params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] = "0";
+  params.queryConfigs[core::QueryConfig::kRelocationMigrateIncludeBuckets] =
+      includeBuckets ? "true" : "false";
+  auto task = assertQuery(params, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
+
+  EXPECT_GT(relocatedBytes(task), 0);
+  for (const auto& [_, nodeStats] : exec::toPlanStats(task->taskStats())) {
+    EXPECT_EQ(nodeStats.spilledBytes, 0);
+  }
+}
+
+TEST_F(CxlAggregationRelocateTest, repeatedMigrationAccountingBalances) {
+  if (!movePagesAvailable()) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+  runRepeatedMigration("cxl-agg-migrate-repeated", /*includeBuckets=*/false);
+}
+
+// With --migrate_buckets the bucket array is migrated too. It is reallocated on
+// rehash, so its bytes must be excluded from the relieved accounting --
+// counting them would relieve pages that the rehash later frees,
+// double-releasing them. Many reclaims interleave rehashes, so the accounting
+// must still balance.
+TEST_F(
+    CxlAggregationRelocateTest,
+    repeatedMigrationWithBucketsAccountingBalances) {
+  if (!movePagesAvailable()) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+  runRepeatedMigration("cxl-agg-migrate-buckets", /*includeBuckets=*/true);
 }
 
 // Relocation does not depend on disk spill. With only 'relocation_resource_tag'

@@ -183,17 +183,20 @@ int64_t AllocationPool::migratePagesToNode(int32_t numaNode) {
   int64_t numFailed = 0;
   for (auto i = numMigratedRanges_; i < numRanges; ++i) {
     const auto range = rangeAt(i);
-    // Resume from where the previous call stopped in the first range;
-    // page-align the offset down so the address handed to move_pages stays page
-    // aligned (the boundary page may be re-migrated, which is a no-op).
-    int64_t offset = (i == numMigratedRanges_) ? migratedBytesInRange_ : 0;
-    offset &= ~(pageSize - 1);
-    if (offset >= range.size()) {
+    // Bytes already migrated in this range on a previous call; only the newly
+    // grown extent counts toward the returned total.
+    const int64_t resumeBytes =
+        (i == numMigratedRanges_) ? migratedBytesInRange_ : 0;
+    if (resumeBytes >= range.size()) {
       continue;
     }
+    // Page-align the migrate offset down so the address handed to move_pages
+    // stays page aligned; the boundary page is re-migrated (a no-op) but not
+    // re-counted -- migratedBytes advances only past 'resumeBytes'.
+    const int64_t offset = resumeBytes & ~(pageSize - 1);
     numFailed +=
         migratePages(range.data() + offset, range.size() - offset, numaNode);
-    migratedBytes += range.size() - offset;
+    migratedBytes += range.size() - resumeBytes;
   }
   // Ranges before the last are full and immutable; only the last can grow, so
   // resume there next time.

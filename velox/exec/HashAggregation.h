@@ -89,6 +89,19 @@ class HashAggregation : public Operator {
   // of disk spilling, relieving the DRAM cap and charging the CXL tier budget.
   void reclaimByMigration(memory::MemoryReclaimer::Stats& stats);
 
+  // Reverses the reportExternalFree() relief accumulated in 'migratedBytes_' by
+  // reclaimByMigration(): re-charges the migrated bytes to 'pool()' and credits
+  // the tier back, lifting the shared root cap to cover the restored
+  // reservation. Must run before the payload's real free so the free nets to a
+  // single decrement. Called at noMoreInput() -- before output draining frees
+  // the payload -- and again in close() to cover teardown without noMoreInput()
+  // (e.g. cancellation); a no-op once 'migratedBytes_' is zero.
+  void restoreMigrationAccounting();
+
+  // Restores the root capacity lifted by restoreMigrationAccounting() once the
+  // migrated payload has been freed. A no-op when nothing was lifted.
+  void lowerMigrationCapacity();
+
   void updateRuntimeStats();
 
   void prepareOutput(vector_size_t size);
@@ -173,10 +186,13 @@ class HashAggregation : public Operator {
   const int32_t migrateNumaNode_;
   // Whether migration also moves the hash bucket array, not just the payload.
   const bool migrateBuckets_;
-  // Total bytes migrated with move_pages so far, relieved from 'pool()' via
-  // reportExternalFree() and restored in close() so the payload's eventual
-  // free nets to a single decrement.
+  // Bytes migrated with move_pages whose reportExternalFree() relief has not
+  // yet been reversed. Reset to zero by restoreMigrationAccounting() once the
+  // relief is re-charged to 'pool()'.
   int64_t migratedBytes_{0};
+  // Bytes by which restoreMigrationAccounting() lifted the shared root cap,
+  // pending restoration by lowerMigrationCapacity() after the payload is freed.
+  int64_t liftedCapacityBytes_{0};
 
   // Size of a single output row estimated using
   // 'groupingSet_->estimateRowSize()'. If spilling, this value is set to max

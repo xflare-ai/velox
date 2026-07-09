@@ -1998,9 +1998,13 @@ int64_t HashTable<ignoreNullKeys>::migratePayload(
     migratedBytes += container->migrateRowsToNode(numaNode);
   }
   if (includeBuckets && tableAllocation_.data() != nullptr) {
+    // Place the bucket array on the tier for measurement, but do not count it
+    // toward the migrated (relieved) bytes: rehash reallocates
+    // tableAllocation_, and the old allocation's free during that realloc would
+    // double-release any bytes relieved here. The row payload is append-only
+    // and freed only at teardown, so only it is safe to relieve.
     memory::migratePages(
         tableAllocation_.data(), tableAllocation_.size(), numaNode);
-    migratedBytes += tableAllocation_.size();
   }
   return migratedBytes;
 }
@@ -2162,9 +2166,8 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   }
   otherTables_.reserve(tables.size());
   for (auto& table : tables) {
-    otherTables_.emplace_back(
-        std::unique_ptr<HashTable<ignoreNullKeys>>(
-            dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+    otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
+        dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags

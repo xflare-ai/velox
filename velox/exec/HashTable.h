@@ -473,9 +473,10 @@ class BaseHashTable {
 
   /// Migrates the payload rows of 'rows()' in place to NUMA node 'numaNode'
   /// with move_pages, leaving virtual addresses and the index untouched. If
-  /// 'includeBuckets' is true, also migrates the bucket array. Returns the
-  /// number of bytes whose pages were migrated. Same table restrictions as
-  /// relocatePayload().
+  /// 'includeBuckets' is true, also migrates the bucket array in place, though
+  /// its bytes are excluded from the return value because rehash reallocates
+  /// it. Returns the number of payload (row) bytes whose pages were migrated.
+  /// Same table restrictions as relocatePayload().
   virtual int64_t migratePayload(int32_t numaNode, bool includeBuckets);
 
   /// Static functions for processing internals. Public because used in
@@ -502,7 +503,8 @@ class BaseHashTable {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  static TagVector loadTags(uint8_t* tags, int64_t tagIndex) {
+  static TagVector
+  loadTags(uint8_t* tags, int64_t tagIndex) {
     // Cannot use xsimd::batch::unaligned here because we need to skip TSAN.
     auto src = tags + tagIndex;
 #if XSIMD_WITH_SSE2
@@ -719,9 +721,8 @@ class HashTable : public BaseHashTable {
     return hashMode_;
   }
 
-  void addRuntimeStats(
-      std::unordered_map<std::string, RuntimeMetric>& runtimeStats)
-      const override {
+  void addRuntimeStats(std::unordered_map<std::string, RuntimeMetric>&
+                           runtimeStats) const override {
     runtimeStats[std::string(kCapacity)] = RuntimeMetric(capacity_);
     runtimeStats[std::string(kHashMode)] =
         RuntimeMetric(static_cast<int64_t>(hashMode_));

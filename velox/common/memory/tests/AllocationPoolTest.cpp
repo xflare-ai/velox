@@ -273,3 +273,44 @@ TEST_F(AllocationPoolTest, migratePagesToNode) {
   EXPECT_LT(migratedAgain, migrated + kChunkBytes * kNumChunks)
       << "second migration should not re-scan the whole payload";
 }
+
+// Incremental migration must count each byte exactly once even when the used
+// extent is not page aligned at the resume point: the boundary page is
+// re-handed to move_pages (a no-op) but must not be re-counted. Mirrors the
+// aggregation reclaim loop, where the table grows by an arbitrary,
+// non-page-aligned amount between reclaims.
+TEST_F(AllocationPoolTest, migratePagesToNodeIncrementalNoDoubleCount) {
+  auto probe = std::make_unique<memory::AllocationPool>(pool_.get());
+  *reinterpret_cast<int64_t*>(probe->allocateFixed(4096, 1)) = 1;
+  try {
+    probe->migratePagesToNode(0);
+  } catch (const VeloxException&) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+
+  // A chunk size that is not a divisor of the page size, so the used extent
+  // lands mid-page at every reclaim boundary.
+  constexpr int32_t kChunkBytes = 520;
+  constexpr int32_t kChunksPerRound = 3'000;
+  constexpr int32_t kNumRounds = 8;
+
+  auto incremental = std::make_unique<memory::AllocationPool>(pool_.get());
+  incremental->setHugePageThreshold(128 << 10);
+  int64_t incrementalSum = 0;
+  for (int32_t round = 0; round < kNumRounds; ++round) {
+    for (int32_t i = 0; i < kChunksPerRound; ++i) {
+      incremental->allocateFixed(kChunkBytes, 8);
+    }
+    incrementalSum += incremental->migratePagesToNode(0);
+  }
+
+  // Migrating an identically grown pool in a single call is the reference for
+  // the total populated extent; the incremental sum must match it exactly, with
+  // no per-round boundary-page inflation.
+  auto oneShot = std::make_unique<memory::AllocationPool>(pool_.get());
+  oneShot->setHugePageThreshold(128 << 10);
+  for (int32_t i = 0; i < kNumRounds * kChunksPerRound; ++i) {
+    oneShot->allocateFixed(kChunkBytes, 8);
+  }
+  EXPECT_EQ(incrementalSum, oneShot->migratePagesToNode(0));
+}

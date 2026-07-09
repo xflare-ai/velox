@@ -31,6 +31,16 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 
+namespace {
+// Serializes root-capacity lifts/restores for move_pages migration. Drivers of
+// a local aggregation share one root pool, so their overlapping lift windows
+// must read-modify-write the capacity under a common lock.
+std::mutex& migrationCapacityMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+} // namespace
+
 HashAggregation::HashAggregation(
     int32_t operatorId,
     DriverCtx* driverCtx,
@@ -591,6 +601,11 @@ void HashAggregation::noMoreInput() {
 
   // Release the extra reserved memory right after processing all the inputs.
   pool()->release();
+
+  // Reverse the move_pages migration relief now, before getOutput() drains and
+  // frees the payload; deferring to close() would let the free double-decrement
+  // the reservation.
+  restoreMigrationAccounting();
 }
 
 BlockingReason HashAggregation::isBlocked(ContinueFuture* future) {
@@ -700,8 +715,9 @@ void HashAggregation::reclaimByMigration(
   // move_pages keeps virtual addresses stable and does not change pool
   // accounting, so relieve the DRAM cap explicitly (reportExternalFree) and
   // charge the migrated bytes to the CXL tier budget
-  // (reportExternalAllocation). Both are reversed in close() so the payload's
-  // eventual free stays balanced.
+  // (reportExternalAllocation). Both are reversed by
+  // restoreMigrationAccounting() before the payload is freed so its eventual
+  // free stays balanced.
   uint64_t wallNanos{0};
   int64_t moved{0};
   memory::recordRelocatedBytes(pool(), [&] {
@@ -721,44 +737,56 @@ void HashAggregation::reclaimByMigration(
   }
 }
 
-void HashAggregation::close() {
+void HashAggregation::restoreMigrationAccounting() {
   if (migratedBytes_ == 0) {
-    Operator::close();
-    output_ = nullptr;
-    groupingSet_.reset();
     return;
   }
-
-  // move_pages left the migrated allocations owned by 'pool()', so their free
-  // during teardown must be balanced against the reportExternalFree() that
-  // relieved the DRAM cap in reclaimByMigration(). Re-accounting migratedBytes_
-  // pushes the pool above its arbitration cap (the payload is larger than the
-  // cap by design), which VA-stable migration cannot avoid, so lift the cap for
-  // the teardown window. Serialized across drivers (they share the root pool)
-  // and restored so root-pool destruction returns the correct capacity to the
-  // arbitrator.
-  static std::mutex teardownMutex;
-  std::lock_guard<std::mutex> l(teardownMutex);
+  // move_pages left the migrated allocations owned by 'pool()', so re-charge
+  // the relief reportExternalFree() applied during reclaim before those
+  // allocations are freed -- otherwise the free double-decrements the
+  // reservation. Re-adding migratedBytes_ pushes the pool above its arbitration
+  // cap (the payload is larger than the cap by design), which VA-stable
+  // migration cannot avoid, so lift the shared root cap to cover it. Serialized
+  // across drivers; the lift is held until lowerMigrationCapacity() runs after
+  // the payload is freed.
+  std::lock_guard<std::mutex> l(migrationCapacityMutex());
   auto* root = static_cast<memory::MemoryPoolImpl*>(pool()->root());
-  const int64_t savedCapacity = root->capacity();
-  // reservationBytes_ <= capacity_ outside arbitration, so a cap of
-  // savedCapacity + migratedBytes_ makes the reserve below fit without
-  // triggering arbitration. Guard against overflow when capacity is unlimited.
-  const int64_t liftedCapacity =
-      savedCapacity > memory::kMaxMemory - migratedBytes_
+  const int64_t capacity = root->capacity();
+  // Guard against overflow when capacity is unlimited.
+  const int64_t liftedCapacity = capacity > memory::kMaxMemory - migratedBytes_
       ? memory::kMaxMemory
-      : savedCapacity + migratedBytes_;
+      : capacity + migratedBytes_;
   root->testingSetCapacity(liftedCapacity);
+  liftedCapacityBytes_ += liftedCapacity - capacity;
   pool()->reportExternalAllocation(migratedBytes_);
   relocationPool_->reportExternalFree(migratedBytes_);
   migratedBytes_ = 0;
+}
+
+void HashAggregation::lowerMigrationCapacity() {
+  if (liftedCapacityBytes_ == 0) {
+    return;
+  }
+  // The migrated payload has been freed, bringing the reservation back down, so
+  // return the lifted capacity; root-pool destruction then hands the correct
+  // capacity back to the arbitrator.
+  std::lock_guard<std::mutex> l(migrationCapacityMutex());
+  auto* root = static_cast<memory::MemoryPoolImpl*>(pool()->root());
+  root->testingSetCapacity(root->capacity() - liftedCapacityBytes_);
+  liftedCapacityBytes_ = 0;
+}
+
+void HashAggregation::close() {
+  // Normally run at noMoreInput(); repeated here for teardown paths that skip
+  // it (e.g. cancellation), so the accounting is balanced before groupingSet_
+  // frees the payload below.
+  restoreMigrationAccounting();
 
   Operator::close();
   output_ = nullptr;
-  // Frees the payload; its release() brings the reservation back below
-  // savedCapacity before the cap is restored.
   groupingSet_.reset();
-  root->testingSetCapacity(savedCapacity);
+
+  lowerMigrationCapacity();
 }
 
 void HashAggregation::updateEstimatedOutputRowSize() {
