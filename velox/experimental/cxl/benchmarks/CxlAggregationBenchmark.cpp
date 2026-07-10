@@ -14,43 +14,6 @@
  * limitations under the License.
  */
 
-// Microbenchmark for a grouping aggregation over a synthesized Zipf key stream:
-//
-//   SELECT k, sum(v) FROM <synthesized> GROUP BY k
-//
-// Keys follow a Zipf distribution over --zipf_groups ranks (--zipf_skew), so a
-// few hot groups take most updates in random arrival order — the hot/cold split
-// that DRAM-to-CXL tiering targets. --scale_factor sizes the input (1 = ~1GB).
-//
-// The same input runs across memory-placement configurations to measure whether
-// building the table in DRAM and relocating to CXL under pressure (the
-// HashAggregation relocate path) beats the alternatives:
-//
-//   --config=dram       HashAggregation, DRAM pool capped at --dram_limit_mb,
-//                       on-disk spill enabled. The "no CXL" competitor. Set a
-//                       cap above the group table for the no-pressure DRAM
-//                       speed ceiling.
-//   --config=interleave HashAggregation, uncapped; run the process under
-//                       'numactl --interleave=0,<cxl_node>' so the OS stripes
-//                       pages across DRAM and CXL.
-//   --config=cxl        HashAggregation with a real CXL tier pool registered on
-//                       the query (customPool "cxl"); DRAM pool capped (same as
-//                       'dram'). Under pressure reclaim() byte-copies the
-//                       payload to CXL instead of disk spilling (either/or); if
-//                       the CXL pool is exhausted the query fails rather than
-//                       spilling.
-//   --config=cxl_migrate Same as 'cxl', but reclaim() relocates by migrating
-//   the
-//                       payload pages in place to the CXL node with move_pages
-//                       (relocation_mode=migrate), leaving virtual addresses
-//                       and the hash index unchanged. A/B against 'cxl' to
-//                       compare copy+repoint vs VA-stable page migration on the
-//                       real HashTable, single- and multi-driver.
-//
-// Each config is meant to run as a separate process (the numactl policy differs
-// per config, and the 'cxl'/'cxl_migrate' configs register a per-query CXL tier
-// pool). See run_cxl_benchmark.sh.
-
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -126,53 +89,49 @@ DEFINE_bool(
     false,
     "For --config=cxl_migrate, also migrate the hash bucket array to CXL, not "
     "just the row payload.");
+DEFINE_int64(
+    allocator_capacity_gb,
+    64,
+    "Total MmapAllocator capacity in GB, shared by the input and query pools. "
+    "Raise it for large --num_drivers sweeps where the scaled input exceeds the "
+    "default.");
 
 using namespace facebook::velox;
 using exec::test::PlanBuilder;
 
 namespace {
 
-// Per-trial measurements pulled from the finished task's stats.
+constexpr int32_t kBatchSize = 4'096;
+
 struct TrialMetrics {
   uint64_t elapsedMs{0};
   uint64_t aggCpuNanos{0};
   uint64_t aggWallNanos{0};
   uint64_t aggBlockedNanos{0};
   uint64_t aggPeakBytes{0};
-  // Rows produced by the aggregation operator = groups built.
   uint64_t numGroups{0};
   uint64_t spilledBytes{0};
   uint64_t spilledRows{0};
   uint64_t spillWriteNanos{0};
   uint64_t spillReadNanos{0};
-  // Bytes the aggregation moved from DRAM to the CXL tier during reclaim,
-  // summed from the relocatedMemoryBytes runtime stat. Recorded in release
-  // builds too.
   uint64_t relocatedBytes{0};
-  // Wall time spent in move_pages migration during reclaim (cxl_migrate),
-  // summed from the cxlMigrateWallNanos runtime stat.
   uint64_t migrateWallNanos{0};
   int64_t resultRows{0};
   uint64_t checksum{0};
 };
 
-// The byte-copy relocation config.
 bool isCxlCopyConfig() {
   return FLAGS_config == "cxl";
 }
 
-// The move_pages in-place migration config.
 bool isCxlMigrateConfig() {
   return FLAGS_config == "cxl_migrate";
 }
 
-// Both configs relocate into a CXL tier pool during reclaim and share the pool
-// setup; they differ only in the relocation mechanism.
 bool usesCxlTier() {
   return isCxlCopyConfig() || isCxlMigrateConfig();
 }
 
-// Caps the query's DRAM pool for the configs that must feel memory pressure.
 int64_t dramCapacityBytes() {
   if (FLAGS_config == "dram" || usesCxlTier()) {
     return FLAGS_dram_limit_mb << 20;
@@ -180,9 +139,7 @@ int64_t dramCapacityBytes() {
   return memory::kMaxMemory;
 }
 
-// Splits 'input' batches round-robin into 'numChunks' disjoint groups so each
-// source pipeline aggregates its own slice with no overlap or duplication.
-std::vector<std::vector<RowVectorPtr>> splitInput(
+std::vector<std::vector<RowVectorPtr>> splitInputRoundRobin(
     const std::vector<RowVectorPtr>& input,
     int32_t numChunks) {
   std::vector<std::vector<RowVectorPtr>> chunks(numChunks);
@@ -192,20 +149,17 @@ std::vector<std::vector<RowVectorPtr>> splitInput(
   return chunks;
 }
 
-core::PlanNodePtr buildPlan(const std::vector<RowVectorPtr>& input) {
-  if (FLAGS_num_drivers <= 1) {
-    return PlanBuilder()
-        .values(input)
-        .singleAggregation({"k"}, {"sum(v) AS s"})
-        .planNode();
-  }
-  // Parallel plan: each disjoint input slice is read by its own (single-driver)
-  // source pipeline, then 'localPartition' repartitions the rows by key so each
-  // of the 'num_drivers' consumer drivers sees every row for the keys it owns
-  // and runs a complete aggregation. Equivalent result to the serial plan; each
-  // complete aggregation relocates to the CXL tier under pressure.
+core::PlanNodePtr buildSerialPlan(const std::vector<RowVectorPtr>& input) {
+  return PlanBuilder()
+      .values(input)
+      .singleAggregation({"k"}, {"sum(v) AS s"})
+      .planNode();
+}
+
+core::PlanNodePtr buildKeyPartitionedPlan(
+    const std::vector<RowVectorPtr>& input) {
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  const auto chunks = splitInput(input, FLAGS_num_drivers);
+  const auto chunks = splitInputRoundRobin(input, FLAGS_num_drivers);
   std::vector<core::PlanNodePtr> sources;
   sources.reserve(chunks.size());
   for (const auto& chunk : chunks) {
@@ -218,8 +172,11 @@ core::PlanNodePtr buildPlan(const std::vector<RowVectorPtr>& input) {
       .planNode();
 }
 
-// Sums the output grouping-key column into a checksum so the configs can be
-// cross-checked for identical results (guards the silent-null class of bugs).
+core::PlanNodePtr buildPlan(const std::vector<RowVectorPtr>& input) {
+  return FLAGS_num_drivers <= 1 ? buildSerialPlan(input)
+                                : buildKeyPartitionedPlan(input);
+}
+
 void accumulateResult(
     const std::vector<RowVectorPtr>& results,
     TrialMetrics& metrics) {
@@ -228,8 +185,6 @@ void accumulateResult(
       continue;
     }
     metrics.resultRows += result->size();
-    // Decode so the checksum is correct regardless of the output vector's
-    // encoding (flat, dictionary, constant).
     SelectivityVector rows(result->size());
     DecodedVector decoded(*result->childAt(0), rows);
     for (auto i = 0; i < result->size(); ++i) {
@@ -247,69 +202,110 @@ uint64_t runtimeSum(
   return it == stats.end() ? 0 : static_cast<uint64_t>(it->second.sum);
 }
 
+bool isAggregationOperator(const exec::OperatorStats& op) {
+  return op.operatorType.find("Aggregation") != std::string::npos;
+}
+
+void accumulateAggregationStats(
+    const exec::OperatorStats& op,
+    TrialMetrics& metrics) {
+  metrics.aggCpuNanos += op.addInputTiming.cpuNanos +
+      op.getOutputTiming.cpuNanos + op.finishTiming.cpuNanos;
+  metrics.aggWallNanos += op.addInputTiming.wallNanos +
+      op.getOutputTiming.wallNanos + op.finishTiming.wallNanos;
+  metrics.aggBlockedNanos += op.blockedWallNanos;
+  metrics.aggPeakBytes = std::max<uint64_t>(
+      metrics.aggPeakBytes, op.memoryStats.peakTotalMemoryReservation);
+  metrics.numGroups += op.outputPositions;
+  metrics.spilledBytes += op.spilledBytes;
+  metrics.spilledRows += op.spilledRows;
+  metrics.spillWriteNanos += runtimeSum(op.runtimeStats, "spillWriteWallNanos");
+  metrics.spillReadNanos += runtimeSum(op.runtimeStats, "spillReadWallNanos");
+  metrics.relocatedBytes +=
+      runtimeSum(op.runtimeStats, memory::kRelocatedMemoryBytes);
+  metrics.migrateWallNanos +=
+      runtimeSum(op.runtimeStats, "cxlMigrateWallNanos");
+}
+
 void collectOperatorStats(const exec::TaskStats& stats, TrialMetrics& metrics) {
   metrics.elapsedMs = stats.executionEndTimeMs - stats.executionStartTimeMs;
   for (const auto& pipeline : stats.pipelineStats) {
     for (const auto& op : pipeline.operatorStats) {
-      // Matches stock "Aggregation" and our "CxlAggregation".
-      if (op.operatorType.find("Aggregation") != std::string::npos) {
-        metrics.aggCpuNanos += op.addInputTiming.cpuNanos +
-            op.getOutputTiming.cpuNanos + op.finishTiming.cpuNanos;
-        metrics.aggWallNanos += op.addInputTiming.wallNanos +
-            op.getOutputTiming.wallNanos + op.finishTiming.wallNanos;
-        metrics.aggBlockedNanos += op.blockedWallNanos;
-        metrics.aggPeakBytes = std::max<uint64_t>(
-            metrics.aggPeakBytes, op.memoryStats.peakTotalMemoryReservation);
-        metrics.numGroups += op.outputPositions;
-        metrics.spilledBytes += op.spilledBytes;
-        metrics.spilledRows += op.spilledRows;
-        metrics.spillWriteNanos +=
-            runtimeSum(op.runtimeStats, "spillWriteWallNanos");
-        metrics.spillReadNanos +=
-            runtimeSum(op.runtimeStats, "spillReadWallNanos");
-        metrics.relocatedBytes +=
-            runtimeSum(op.runtimeStats, memory::kRelocatedMemoryBytes);
-        metrics.migrateWallNanos +=
-            runtimeSum(op.runtimeStats, "cxlMigrateWallNanos");
+      if (isAggregationOperator(op)) {
+        accumulateAggregationStats(op, metrics);
       }
     }
   }
 }
 
-// Synthesizes the input: (k BIGINT, v BIGINT) batches whose keys follow a Zipf
-// distribution over --zipf_groups ranks and arrive in random order, allocated
-// from 'outputPool', which must outlive the trials. Per-batch seeds are fixed,
-// so every config and trial sees identical input.
-std::vector<RowVectorPtr> generateZipfInput(
-    const std::shared_ptr<memory::MemoryPool>& outputPool) {
-  // Size the input by target bytes: scale_factor = 1 is ~1GB of (k, v) data.
+int64_t targetRowCount() {
   constexpr int64_t kInputBytesPerRow = sizeof(int64_t) * 2;
-  const auto numRows = static_cast<int64_t>(FLAGS_scale_factor * (1LL << 30)) /
+  return static_cast<int64_t>(FLAGS_scale_factor * (1LL << 30)) /
       kInputBytesPerRow;
-  const int64_t numGroups = FLAGS_zipf_groups;
-  const auto startMs = getCurrentTimeMs();
+}
 
-  // Cumulative distribution over ranks 1..numGroups, rank r weighted 1/r^skew.
+std::vector<double> buildZipfCdf(int64_t numGroups, double skew) {
   std::vector<double> cdf(numGroups);
   double total = 0;
   for (int64_t rank = 0; rank < numGroups; ++rank) {
-    total += 1.0 / std::pow(rank + 1, FLAGS_zipf_skew);
+    total += 1.0 / std::pow(rank + 1, skew);
     cdf[rank] = total;
   }
   for (auto& value : cdf) {
     value /= total;
   }
+  return cdf;
+}
 
-  const auto rowType = ROW({"k", "v"}, {BIGINT(), BIGINT()});
-  constexpr int32_t kBatchSize = 4'096;
-  const int64_t numBatches = (numRows + kBatchSize - 1) / kBatchSize;
-  std::vector<RowVectorPtr> batches(numBatches);
+int64_t pickRank(
+    int64_t globalRow,
+    int64_t numGroups,
+    const std::vector<double>& cdf,
+    std::mt19937_64& rng,
+    std::uniform_real_distribution<double>& uniform) {
+  if (globalRow < numGroups) {
+    return globalRow;
+  }
+  return std::upper_bound(cdf.begin(), cdf.end(), uniform(rng)) - cdf.begin();
+}
 
-  // Fill the independent batches in parallel. Each batch is seeded only by its
-  // own row offset (42 + begin), so the data is bit-identical to a serial run
-  // and every config still sees the same input; 'outputPool' is thread-safe and
-  // each thread writes disjoint batch slots. This keeps generation (excluded
-  // from the measured trials) from dominating wall time at high scale factors.
+int64_t scatterKey(int64_t rank) {
+  return static_cast<int64_t>(
+      static_cast<uint64_t>(rank + 1) * 0x9E3779B97F4A7C15ULL);
+}
+
+RowVectorPtr makeZipfBatch(
+    int64_t begin,
+    vector_size_t size,
+    int64_t numGroups,
+    const std::vector<double>& cdf,
+    const RowTypePtr& rowType,
+    memory::MemoryPool* pool) {
+  std::mt19937_64 rng(42 + begin);
+  std::uniform_real_distribution<double> uniform(0.0, 1.0);
+  auto keys = BaseVector::create<FlatVector<int64_t>>(BIGINT(), size, pool);
+  auto values = BaseVector::create<FlatVector<int64_t>>(BIGINT(), size, pool);
+  for (vector_size_t i = 0; i < size; ++i) {
+    const int64_t rank = pickRank(begin + i, numGroups, cdf, rng, uniform);
+    keys->set(i, scatterKey(rank));
+    values->set(i, static_cast<int64_t>(uniform(rng) * 100));
+  }
+  return std::make_shared<RowVector>(
+      pool,
+      rowType,
+      nullptr,
+      size,
+      std::vector<VectorPtr>{std::move(keys), std::move(values)});
+}
+
+int64_t fillBatchesInParallel(
+    std::vector<RowVectorPtr>& batches,
+    int64_t numRows,
+    int64_t numGroups,
+    const std::vector<double>& cdf,
+    const RowTypePtr& rowType,
+    memory::MemoryPool* pool) {
+  const int64_t numBatches = batches.size();
   const int64_t numThreads = std::min<int64_t>(
       numBatches, std::max<unsigned>(1u, std::thread::hardware_concurrency()));
   const int64_t batchesPerThread = (numBatches + numThreads - 1) / numThreads;
@@ -328,36 +324,8 @@ std::vector<RowVectorPtr> generateZipfInput(
         const int64_t begin = batch * kBatchSize;
         const auto size = static_cast<vector_size_t>(
             std::min<int64_t>(kBatchSize, numRows - begin));
-        std::mt19937_64 rng(42 + begin);
-        std::uniform_real_distribution<double> uniform(0.0, 1.0);
-        auto keys = BaseVector::create<FlatVector<int64_t>>(
-            BIGINT(), size, outputPool.get());
-        auto values = BaseVector::create<FlatVector<int64_t>>(
-            BIGINT(), size, outputPool.get());
-        for (vector_size_t i = 0; i < size; ++i) {
-          const int64_t globalRow = begin + i;
-          // Seed pass: the first 'numGroups' rows emit each group once so the
-          // group count stays constant across skew. Requires numRows >=
-          // numGroups. Remaining rows draw their rank from the Zipf CDF.
-          const int64_t rank = globalRow < numGroups
-              ? globalRow
-              : std::upper_bound(cdf.begin(), cdf.end(), uniform(rng)) -
-                  cdf.begin();
-          // Scatter ranks over the key space so hot keys are not adjacent. The
-          // odd multiplier is invertible mod 2^64, so distinct ranks stay
-          // distinct.
-          keys->set(
-              i,
-              static_cast<int64_t>(
-                  static_cast<uint64_t>(rank + 1) * 0x9E3779B97F4A7C15ULL));
-          values->set(i, static_cast<int64_t>(uniform(rng) * 100));
-        }
-        batches[batch] = std::make_shared<RowVector>(
-            outputPool.get(),
-            rowType,
-            nullptr,
-            size,
-            std::vector<VectorPtr>{std::move(keys), std::move(values)});
+        batches[batch] =
+            makeZipfBatch(begin, size, numGroups, cdf, rowType, pool);
         threadBytes[t] += batches[batch]->retainedSize();
       }
     });
@@ -369,37 +337,53 @@ std::vector<RowVectorPtr> generateZipfInput(
   for (const auto bytes : threadBytes) {
     numBytes += bytes;
   }
+  return numBytes;
+}
+
+void printGenerationSummary(
+    int64_t numRows,
+    int64_t numGroups,
+    size_t numBatches,
+    int64_t numBytes,
+    int64_t elapsedMs) {
   std::cout << fmt::format(
                    "generated {} zipf rows ({} groups, skew {}) in {} "
                    "batches, {:.1f} MB, {} ms (excluded from trials)\n",
                    numRows,
                    numGroups,
                    FLAGS_zipf_skew,
-                   batches.size(),
+                   numBatches,
                    numBytes / static_cast<double>(1 << 20),
-                   getCurrentTimeMs() - startMs)
+                   elapsedMs)
             << std::flush;
+}
+
+std::vector<RowVectorPtr> generateZipfInput(
+    const std::shared_ptr<memory::MemoryPool>& outputPool) {
+  const int64_t numRows = targetRowCount();
+  const int64_t numGroups = FLAGS_zipf_groups;
+  const auto startMs = getCurrentTimeMs();
+  const auto cdf = buildZipfCdf(numGroups, FLAGS_zipf_skew);
+  const auto rowType = ROW({"k", "v"}, {BIGINT(), BIGINT()});
+  const int64_t numBatches = (numRows + kBatchSize - 1) / kBatchSize;
+  std::vector<RowVectorPtr> batches(numBatches);
+  const int64_t numBytes = fillBatchesInParallel(
+      batches, numRows, numGroups, cdf, rowType, outputPool.get());
+  printGenerationSummary(
+      numRows, numGroups, batches.size(), numBytes, getCurrentTimeMs() - startMs);
   return batches;
 }
 
-TrialMetrics runTrial(
-    const core::PlanNodePtr& plan,
+std::shared_ptr<core::QueryCtx> makeQueryCtx(
+    const std::string& queryId,
     folly::Executor* executor,
-    int32_t trial) {
+    std::shared_ptr<memory::CustomMemoryResource>& cxlResource) {
   auto* manager = memory::memoryManager();
-  const auto queryId = fmt::format("{}-{}", FLAGS_config, trial);
-
-  // The CXL resource must outlive the pools that borrow its allocator, so it is
-  // declared before the QueryCtx and the cursor.
-  std::shared_ptr<memory::CustomMemoryResource> cxlResource;
-
   auto rootPool = manager->addRootPool(
       queryId, dramCapacityBytes(), memory::MemoryReclaimer::create());
-
   auto builder =
       core::QueryCtx::Builder().executor(executor).pool(rootPool).queryId(
           queryId);
-
   if (usesCxlTier()) {
     cxlResource = cxl::CxlMemoryResource::create(
         FLAGS_cxl_numa_node, FLAGS_cxl_capacity_mb << 20);
@@ -407,7 +391,6 @@ TrialMetrics runTrial(
     builder.customPool(
         std::string{cxl::CxlMemoryResource::kTag}, std::move(cxlPool));
   }
-
   auto queryCtx = builder.build();
   if (usesCxlTier()) {
     auto registry =
@@ -416,38 +399,48 @@ TrialMetrics runTrial(
         memory::kCustomMemoryResourceRegistryKey, registry);
     registry->insert(std::string{cxl::CxlMemoryResource::kTag}, cxlResource);
   }
+  return queryCtx;
+}
 
+exec::CursorParameters makeCursorParameters(
+    const core::PlanNodePtr& plan,
+    const std::shared_ptr<core::QueryCtx>& queryCtx) {
   exec::CursorParameters params;
   params.planNode = plan;
   params.queryCtx = queryCtx;
   params.maxDrivers = std::max(1, FLAGS_num_drivers);
   params.copyResult = true;
-
   if (FLAGS_config == "dram" || usesCxlTier()) {
     params.spillDirectory = FLAGS_spill_dir;
     params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
     params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
   }
   if (usesCxlTier()) {
-    // Route reclaim to the "cxl" tier pool registered above instead of disk.
     params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
         std::string{cxl::CxlMemoryResource::kTag};
   }
   if (isCxlMigrateConfig()) {
-    // Relocate by migrating the payload pages in place with move_pages to the
-    // CXL node, instead of the byte-copy relocation.
     params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
     params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] =
         std::to_string(FLAGS_cxl_numa_node);
     params.queryConfigs[core::QueryConfig::kRelocationMigrateIncludeBuckets] =
         FLAGS_migrate_buckets ? "true" : "false";
   }
+  return params;
+}
 
+TrialMetrics runTrial(
+    const core::PlanNodePtr& plan,
+    folly::Executor* executor,
+    int32_t trial) {
+  const auto queryId = fmt::format("{}-{}", FLAGS_config, trial);
+  std::shared_ptr<memory::CustomMemoryResource> cxlResource;
+  auto queryCtx = makeQueryCtx(queryId, executor, cxlResource);
+  const auto params = makeCursorParameters(plan, queryCtx);
   auto [cursor, results] = exec::test::readCursor(
       params, [](exec::TaskCursor* cursor) { cursor->setNoMoreSplits(); });
   exec::test::waitForTaskCompletion(
-      cursor->task().get(), /*maxWaitMicros=*/600'000'000);
-
+      cursor->task().get(), 600'000'000);
   TrialMetrics metrics;
   collectOperatorStats(cursor->task()->taskStats(), metrics);
   accumulateResult(results, metrics);
@@ -462,13 +455,7 @@ double medianMs(std::vector<uint64_t> values) {
   return values[values.size() / 2];
 }
 
-void report(const std::vector<TrialMetrics>& trials) {
-  std::vector<uint64_t> elapsed;
-  for (const auto& trial : trials) {
-    elapsed.push_back(trial.elapsedMs);
-  }
-  const auto& last = trials.back();
-
+void printRunConfig(size_t trialCount) {
   std::cout << "\n=== CXL aggregation benchmark ===\n";
   std::cout << fmt::format(
                    "config={} scale_factor={} zipf_groups={} zipf_skew={} "
@@ -478,7 +465,7 @@ void report(const std::vector<TrialMetrics>& trials) {
                    FLAGS_zipf_groups,
                    FLAGS_zipf_skew,
                    FLAGS_dram_limit_mb,
-                   trials.size())
+                   trialCount)
             << "\n";
   if (usesCxlTier()) {
     std::cout << fmt::format(
@@ -487,7 +474,9 @@ void report(const std::vector<TrialMetrics>& trials) {
                      FLAGS_cxl_capacity_mb)
               << "\n";
   }
-  std::cout << fmt::format("median elapsed: {:.1f} ms\n", medianMs(elapsed));
+}
+
+void printAggregation(const TrialMetrics& last) {
   std::cout << fmt::format(
       "aggregation: cpu={:.1f} ms wall={:.1f} ms blocked={:.1f} "
       "ms peak={:.1f} MB\n",
@@ -495,29 +484,33 @@ void report(const std::vector<TrialMetrics>& trials) {
       last.aggWallNanos / 1e6,
       last.aggBlockedNanos / 1e6,
       last.aggPeakBytes / static_cast<double>(1 << 20));
-  // On 'cxl' a non-zero figure means the CXL pool overflowed to disk.
-  if (FLAGS_config == "dram" || usesCxlTier()) {
+}
+
+void printSpill(const TrialMetrics& last) {
+  std::cout << fmt::format(
+      "spill: bytes={:.1f} MB rows={} write={:.1f} ms read={:.1f} ms\n",
+      last.spilledBytes / static_cast<double>(1 << 20),
+      last.spilledRows,
+      last.spillWriteNanos / 1e6,
+      last.spillReadNanos / 1e6);
+}
+
+void printRelocation(const TrialMetrics& last) {
+  std::cout << fmt::format(
+      "cxl relocated: {:.1f} MB\n",
+      last.relocatedBytes / static_cast<double>(1 << 20));
+  if (isCxlMigrateConfig()) {
     std::cout << fmt::format(
-        "spill: bytes={:.1f} MB rows={} write={:.1f} ms read={:.1f} ms\n",
-        last.spilledBytes / static_cast<double>(1 << 20),
-        last.spilledRows,
-        last.spillWriteNanos / 1e6,
-        last.spillReadNanos / 1e6);
+        "cxl migrate wall: {:.1f} ms\n", last.migrateWallNanos / 1e6);
   }
-  if (usesCxlTier()) {
-    std::cout << fmt::format(
-        "cxl relocated: {:.1f} MB\n",
-        last.relocatedBytes / static_cast<double>(1 << 20));
-    if (isCxlMigrateConfig()) {
-      std::cout << fmt::format(
-          "cxl migrate wall: {:.1f} ms\n", last.migrateWallNanos / 1e6);
-    }
-    if (last.relocatedBytes == 0) {
-      std::cout << "WARNING: no relocation fired; the DRAM cap did not trigger "
-                   "the arbitrator. Lower --dram_limit_mb or verify the CXL "
-                   "pool is set.\n";
-    }
+  if (last.relocatedBytes == 0) {
+    std::cout << "WARNING: no relocation fired; the DRAM cap did not trigger "
+                 "the arbitrator. Lower --dram_limit_mb or verify the CXL "
+                 "pool is set.\n";
   }
+}
+
+void printResult(const TrialMetrics& last) {
   std::cout << fmt::format(
                    "result: groups built={} output rows={} checksum={}\n",
                    last.numGroups,
@@ -526,11 +519,25 @@ void report(const std::vector<TrialMetrics>& trials) {
             << std::flush;
 }
 
-} // namespace
+void report(const std::vector<TrialMetrics>& trials) {
+  std::vector<uint64_t> elapsed;
+  for (const auto& trial : trials) {
+    elapsed.push_back(trial.elapsedMs);
+  }
+  const auto& last = trials.back();
+  printRunConfig(trials.size());
+  std::cout << fmt::format("median elapsed: {:.1f} ms\n", medianMs(elapsed));
+  printAggregation(last);
+  if (FLAGS_config == "dram" || usesCxlTier()) {
+    printSpill(last);
+  }
+  if (usesCxlTier()) {
+    printRelocation(last);
+  }
+  printResult(last);
+}
 
-int main(int argc, char** argv) {
-  folly::Init init{&argc, &argv};
-
+int validateFlags() {
   if (FLAGS_zipf_groups <= 0) {
     LOG(ERROR) << "--zipf_groups must be > 0.";
     return 1;
@@ -547,14 +554,19 @@ int main(int argc, char** argv) {
                   "pre-reserves this capacity.";
     return 1;
   }
+  return 0;
+}
 
+void initializeMemoryManager() {
   memory::SharedArbitrator::registerFactory();
   memory::MemoryManager::Options options;
-  options.allocatorCapacity = 64UL << 30;
+  options.allocatorCapacity = FLAGS_allocator_capacity_gb << 30;
   options.arbitratorKind = "SHARED";
   options.useMmapAllocator = true;
   memory::MemoryManager::testingSetInstance(options);
+}
 
+void registerRuntimeComponents() {
   filesystems::registerLocalFileSystem();
   if (!isRegisteredVectorSerde()) {
     serializer::presto::PrestoVectorSerde::registerVectorSerde();
@@ -565,43 +577,43 @@ int main(int argc, char** argv) {
   functions::prestosql::registerAllScalarFunctions();
   aggregate::prestosql::registerAllAggregateFunctions();
   parse::registerTypeResolver();
+}
 
-  // The CXL config relocates inside HashAggregation when a "cxl" tier pool is
-  // present on the query (configured per trial). Relocation is observed via the
-  // relocatedMemoryBytes runtime stat collected in collectOperatorStats().
-  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(
-      std::thread::hardware_concurrency());
-
-  // 'inputPool' is declared before 'input' and 'plan' because both hold vectors
-  // whose buffers free into it on destruction; it must die last.
-  std::shared_ptr<memory::MemoryPool> inputPool;
+int runBenchmark(folly::Executor* executor) {
+  auto inputPool = memory::memoryManager()->addLeafPool("cxl-bench-input");
   std::vector<RowVectorPtr> input;
   core::PlanNodePtr plan;
   try {
-    inputPool = memory::memoryManager()->addLeafPool("cxl-bench-input");
     input = generateZipfInput(inputPool);
     plan = buildPlan(input);
-
     for (auto i = 0; i < FLAGS_warmup; ++i) {
-      runTrial(plan, executor.get(), /*trial=*/-1 - i);
+      runTrial(plan, executor, -1 - i);
     }
-
     std::vector<TrialMetrics> trials;
     for (auto i = 0; i < FLAGS_num_trials; ++i) {
-      trials.push_back(runTrial(plan, executor.get(), i));
+      trials.push_back(runTrial(plan, executor, i));
     }
-
     report(trials);
   } catch (const std::exception& e) {
     LOG(ERROR) << "Benchmark config '" << FLAGS_config
                << "' failed: " << e.what();
-    exec::test::waitForAllTasksToBeDeleted(/*maxWaitUs=*/30'000'000);
+    exec::test::waitForAllTasksToBeDeleted(30'000'000);
     return 1;
   }
-
-  // Tasks are destroyed asynchronously on executor threads and hold the plan
-  // and the input vectors whose buffers free into 'inputPool'. Wait for them so
-  // no straggler outlives the pool.
-  exec::test::waitForAllTasksToBeDeleted(/*maxWaitUs=*/30'000'000);
+  exec::test::waitForAllTasksToBeDeleted(30'000'000);
   return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+  folly::Init init{&argc, &argv};
+  if (const int rc = validateFlags(); rc != 0) {
+    return rc;
+  }
+  initializeMemoryManager();
+  registerRuntimeComponents();
+  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(
+      std::thread::hardware_concurrency());
+  return runBenchmark(executor.get());
 }
