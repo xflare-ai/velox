@@ -656,6 +656,12 @@ void HashAggregation::reclaim(
     if (!noMoreInput_) {
       if (migrateRelocation_) {
         reclaimByMigration(stats);
+        // Shed the reservation held above actual usage, as the copy path does
+        // via pool()->release() below. move_pages relieves only the migrated
+        // payload; the per-driver reservation slack (reserved minus used) would
+        // otherwise stay pinned, and across many drivers the sum fills the
+        // shared cap so later grows fail with MEM_CAP_EXCEEDED.
+        pool()->release();
       } else {
         // Disk-spill fallback on tier exhaustion is not implemented.
         if (!relocationPool_->maybeReserve(targetBytes)) {
