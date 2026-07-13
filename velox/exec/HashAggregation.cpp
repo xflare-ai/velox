@@ -766,6 +766,12 @@ void HashAggregation::restoreMigrationAccounting() {
   if (migratedBytes_ == 0) {
     return;
   }
+  // Hook for tests to inject a task termination and/or shrink the root capacity
+  // before the re-charge below, reproducing the teardown-during-termination
+  // path deterministically. Passes the root pool so the test can adjust it.
+  TestValue::adjust(
+      "facebook::velox::exec::HashAggregation::restoreMigrationAccounting",
+      pool()->root());
   // move_pages left the migrated allocations owned by 'pool()', so re-charge
   // the relief reportExternalFree() applied during reclaim before those
   // allocations are freed -- otherwise the free double-decrements the
@@ -783,7 +789,21 @@ void HashAggregation::restoreMigrationAccounting() {
       : capacity + migratedBytes_;
   root->testingSetCapacity(liftedCapacity);
   liftedCapacityBytes_ += liftedCapacity - capacity;
-  pool()->reportExternalAllocation(migratedBytes_);
+  // reportExternalAllocation() reserves migratedBytes_, which propagates to the
+  // shared root. On a contended root the lift above may not fully absorb it
+  // (sibling drivers' live reservations, plus the reserve's quantization), so
+  // the reserve would fall through to growCapacity() and enter memory
+  // arbitration. This runs on teardown paths -- including close() when a peer
+  // driver's MEM_CAP_EXCEEDED has already terminated the task -- where entering
+  // arbitration throws "Terminate detected when entering suspension", a throw
+  // from close() that aborts the process. Mark the re-charge as running under
+  // arbitration so the reservation is admitted as controlled overuse (which
+  // lowerMigrationCapacity() reconciles once the payload frees) instead of
+  // entering arbitration itself.
+  {
+    memory::ScopedMemoryArbitrationContext arbitrationCtx{};
+    pool()->reportExternalAllocation(migratedBytes_);
+  }
   // Release only the bytes that actually reached the tier; a failed tier charge
   // during reclaim relieves the DRAM cap without charging the tier.
   if (tierChargedBytes_ > 0) {

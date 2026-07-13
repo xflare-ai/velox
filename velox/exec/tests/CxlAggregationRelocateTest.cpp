@@ -25,6 +25,7 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/common/memory/MemoryArbitrator.h"
+#include "velox/common/memory/MemoryPool.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Cursor.h"
@@ -368,6 +369,99 @@ TEST_F(CxlAggregationRelocateTest, migrateToleratesTierChargeFailure) {
   // exhaustion; the base class's pool leak checks assert the teardown balance.
   auto task = assertQuery(params, "SELECT c0, sum(c1) FROM tmp GROUP BY c0");
   EXPECT_GT(relocatedBytes(task), 0);
+}
+
+// A move_pages migration followed by early task termination (before
+// noMoreInput()) leaves the migration accounting pending, so close() re-runs
+// restoreMigrationAccounting() on the terminating task -- the config-D teardown
+// path a peer driver's MEM_CAP_EXCEEDED triggers at multi-driver scale. The
+// re-charge there reserves migratedBytes_ on the pool; on a contended shared
+// root that reserve overshoots the lifted capacity and routes through memory
+// arbitration, whose suspension entry throws "Terminate detected when entering
+// suspension" once the task is terminating -- a throw from close() that
+// std::terminates the process. This reproduces that state deterministically on
+// a single driver: the first restore (at noMoreInput()) fails the driver, which
+// terminates the task without aborting the pool (Task::setError) and leaves
+// migratedBytes_ pending; the second restore (at close(), task now terminating)
+// runs against a root capacity shrunk below the pending reservation, so the
+// fixed lift cannot cover the re-charge and it must enter arbitration. With the
+// fix the re-charge is admitted without arbitration, so the query fails cleanly
+// with the injected error (not a crash) and teardown balances (base-class pool
+// leak checks). Before the fix the second restore aborts the process.
+TEST_F(CxlAggregationRelocateTest, migrateRestoreOnTerminatedTaskDoesNotCrash) {
+  if (!movePagesAvailable()) {
+    GTEST_SKIP() << "move_pages not available on this host";
+  }
+  constexpr int32_t kFirstBatchRows = 200'000;
+  auto firstBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          kFirstBatchRows, [](auto row) { return static_cast<int64_t>(row); }),
+      makeFlatVector<int64_t>(kFirstBatchRows, [](auto row) { return row; }),
+  });
+  auto secondBatch = makeRowVector({
+      makeFlatVector<int64_t>(
+          8, [](auto row) { return kFirstBatchRows + row; }),
+      makeFlatVector<int64_t>(8, [](auto row) { return row; }),
+  });
+  std::vector<RowVectorPtr> batches{firstBatch, secondBatch};
+  createDuckDbTable(batches);
+
+  exec::TestScopedSpillInjection injectSpill(
+      /*spillPct=*/100, /*poolRegExp=*/".*", /*maxInjections=*/1);
+
+  // restoreMigrationAccounting() runs first at noMoreInput() (migratedBytes_
+  // set by the injected migration) and again at close(). On the first call,
+  // throw to fail the driver: the task terminates without the pool being
+  // aborted,
+  // and migratedBytes_ stays pending for close(). On the second call (close(),
+  // task terminating), shrink the root capacity below the live reservation so
+  // the re-charge overshoots even the code's lift and must enter arbitration --
+  // the crash path.
+  // Shrinking the capacity via testingSetCapacity() bypasses the arbitrator's
+  // free-capacity accounting, so record the pre-shrink capacity and restore it
+  // after the query; otherwise the arbitrator's teardown leak check trips on
+  // the capacity the test stole (a test artifact unrelated to the code fixed).
+  memory::MemoryPoolImpl* capturedRoot{nullptr};
+  int64_t savedCapacity{0};
+  std::atomic_int restoreCalls{0};
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::exec::HashAggregation::restoreMigrationAccounting",
+      std::function<void(void*)>([&](void* arg) {
+        if (restoreCalls.fetch_add(1) == 0) {
+          VELOX_FAIL("injected mid-stream failure after migration");
+        }
+        capturedRoot = static_cast<memory::MemoryPoolImpl*>(arg);
+        savedCapacity = capturedRoot->capacity();
+        capturedRoot->testingSetCapacity(
+            std::max<int64_t>(1, capturedRoot->reservedBytes() / 2));
+      }));
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  exec::CursorParameters params;
+  params.planNode = PlanBuilder()
+                        .values(batches)
+                        .singleAggregation({"c0"}, {"sum(c1)"})
+                        .planNode();
+  params.queryCtx = makeQueryCtxWithTier("cxl-agg-migrate-terminate");
+  params.spillDirectory = spillDirectory->getPath();
+  params.queryConfigs[core::QueryConfig::kSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kAggregationSpillEnabled] = "true";
+  params.queryConfigs[core::QueryConfig::kRelocationResourceTag] =
+      std::string{CxlMemoryResource::kTag};
+  params.queryConfigs[core::QueryConfig::kRelocationMode] = "migrate";
+  params.queryConfigs[core::QueryConfig::kRelocationMigrateNumaNode] = "0";
+
+  // The query fails with the injected error; the point is that it fails cleanly
+  // instead of crashing the process during teardown.
+  VELOX_ASSERT_THROW(
+      assertQuery(params, "SELECT c0, sum(c1) FROM tmp GROUP BY c0"),
+      "injected mid-stream failure after migration");
+
+  // Undo the test-only capacity shrink so the arbitrator's teardown accounting
+  // (checked by resetMemory()) balances.
+  if (capturedRoot != nullptr) {
+    capturedRoot->testingSetCapacity(savedCapacity);
+  }
 }
 
 // Relocation does not depend on disk spill. With only 'relocation_resource_tag'
